@@ -1,0 +1,175 @@
+app:
+  name: "CVF-01"
+  environment: "development"
+  strategy_version: "0.1.0"
+  status_interval_seconds: 5
+  shutdown_timeout_seconds: 10
+  paper_trading_only: true
+
+markets:
+  canonical_symbols:
+    - "BTC-USDT-PERP"
+    - "ETH-USDT-PERP"
+  max_open_positions: 1
+
+timing:
+  feature_update_seconds: 1
+  signal_check_seconds: 5
+  feature_windows_seconds: [5, 15, 60]
+  statistics_windows_seconds: [1800, 86400]
+  expected_holding_minutes: [3, 30]
+  time_stop_check_minutes: 10
+  maximum_holding_minutes: 30
+
+exchanges:
+  binance:
+    enabled: true
+    rest_url: "https://fapi.binance.com"
+    public_websocket_url: "wss://fstream.binance.com/ws"
+    symbols:
+      BTC-USDT-PERP: "BTCUSDT"
+      ETH-USDT-PERP: "ETHUSDT"
+    channels:
+      - "aggTrade"
+      - "bookTicker"
+      - "depth5@100ms"
+      - "markPrice@1s"
+      - "forceOrder"
+    rest_pollers:
+      - "open_interest"
+    heartbeat_timeout_seconds: 30
+    reconnect_initial_seconds: 1
+    reconnect_max_seconds: 60
+    reconnect_jitter_seconds: 0.5
+    open_interest_poll_seconds: 5
+  okx:
+    enabled: true
+    rest_url: "https://www.okx.com"
+    public_websocket_url: "wss://ws.okx.com:8443/ws/v5/public"
+    symbols:
+      BTC-USDT-PERP: "BTC-USDT-SWAP"
+      ETH-USDT-PERP: "ETH-USDT-SWAP"
+    channels:
+      - "trades"
+      - "books5"
+      - "open-interest"
+      - "funding-rate"
+      - "mark-price"
+      - "index-tickers"
+      - "liquidation-orders"
+    rest_pollers:
+      - "instrument_metadata"
+    heartbeat_timeout_seconds: 30
+    reconnect_initial_seconds: 1
+    reconnect_max_seconds: 60
+    reconnect_jitter_seconds: 0.5
+    open_interest_poll_seconds: 5
+
+features:
+  order_book_depth: 5
+  order_book_level_weights: [1.0, 0.8, 0.6, 0.4, 0.2]
+  trade_imbalance_windows_seconds: [5, 15, 60]
+  price_impulse_windows_seconds: [5, 15, 60]
+  open_interest_windows_seconds: [15, 60]
+  liquidation_windows_seconds: [5, 15, 60]
+  breakout_lookback_seconds: 180
+  atr_period_seconds: 60
+  zscore_lookback_seconds: 1800
+  spread_percentile_lookback_seconds: 86400
+
+scoring:
+  exchange_factor_weights:
+    taker_imbalance: 0.30
+    ofi: 0.25
+    price_impulse: 0.20
+    open_interest_impulse: 0.15
+    liquidation_impulse: 0.10
+  venue_weights:
+    binance: 0.45
+    okx: 0.45
+    cross_exchange_confirmation: 0.10
+  long_entry_threshold: 1.8
+  short_entry_threshold: -1.8
+  liquidity_penalty_max: 2.0
+  crowding_penalty_max: 2.0
+  data_health_penalty_max: 10.0
+  divergence_penalty_max: 3.0
+
+signal_rules:
+  taker_imbalance_15s_min: 0.12
+  taker_imbalance_5s_confirmation: 0.18
+  ofi_zscore_confirmation: 1.2
+  open_interest_zscore_confirmation: 0.8
+  other_venue_open_interest_zscore_floor: -0.3
+  maximum_recent_move_atr: 1.5
+  maximum_cross_venue_spread_zscore: 3.0
+  maximum_crowding_zscore: 2.5
+  signal_ttl_seconds: 5
+
+execution:
+  fees:
+    binance:
+      maker_bps: 2.0
+      taker_bps: 5.0
+    okx:
+      maker_bps: 2.0
+      taker_bps: 5.0
+  slippage:
+    order_book_levels: 5
+    maximum_profit_share: 0.20
+    fallback_bps: 5.0
+  latency_penalty_bps_per_100ms: 0.05
+  depth_penalty_bps: 0.25
+
+risk:
+  initial_balance_usdt: 10000
+  risk_per_trade_fraction: 0.002
+  daily_loss_limit_fraction: 0.01
+  maximum_daily_trades: 10
+  consecutive_loss_limit: 3
+  maximum_open_positions: 1
+  maximum_notional_leverage: 2.0
+  margin_mode: "isolated"
+  allow_loss_adding: false
+  allow_martingale: false
+
+exits:
+  initial_stop_atr_multiple: 0.55
+  take_profit_1_atr_multiple: 0.8
+  take_profit_2_atr_multiple: 1.3
+  take_profit_1_fraction: 0.5
+  breakeven_offset_bps: 1.0
+  time_stop_minutes: 10
+  time_stop_minimum_profit_atr: 0.25
+  maximum_holding_minutes: 30
+  reverse_score_exit_threshold: 1.2
+
+health:
+  maximum_core_latency_ms: 500
+  stale_after_ms: 1500
+  clock_skew_warning_ms: 250
+  duplicate_cache_size: 10000
+  order_book_gap_forces_resync: true
+  block_entry_statuses:
+    - "STALE"
+    - "RESYNCING"
+    - "DISCONNECTED"
+
+storage:
+  database_url: "sqlite+aiosqlite:///data/cvf.db"
+  raw_data_path: "data/raw"
+  processed_data_path: "data/processed"
+  parquet_batch_rows: 10000
+  parquet_flush_seconds: 5
+  database_batch_rows: 500
+  database_flush_seconds: 1
+
+logging:
+  level: "INFO"
+  json_output: true
+
+replay:
+  preserve_receive_timestamps: true
+  default_speed: 1.0
+  deterministic_seed: 20260723
+

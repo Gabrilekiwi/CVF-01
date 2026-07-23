@@ -1,0 +1,9 @@
+app:
+  environment: "development"
+
+storage:
+  database_url: "sqlite+aiosqlite:///data/cvf-development.db"
+
+logging:
+  level: "DEBUG"
+
