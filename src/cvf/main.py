@@ -8,6 +8,8 @@ import logging
 import signal
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from types import FrameType
 from typing import Any, NoReturn
@@ -19,6 +21,9 @@ from cvf.exchanges.base import ExchangeConnector
 from cvf.exchanges.binance import BinanceMarketDataConnector
 from cvf.exchanges.okx import OKXMarketDataConnector
 from cvf.logging_config import configure_logging
+from cvf.models.enums import Exchange
+from cvf.replay import RawParquetReader, RawScanFilter, ReplayOrder, ReplayRunner
+from cvf.storage.compact import compact_raw_tree
 
 
 def build_connectors(settings: Settings) -> list[ExchangeConnector]:
@@ -172,6 +177,60 @@ async def run_collection(
             "normalized_event_counts": summary.normalized_event_counts,
             "health_status_counts": summary.health_status_counts,
             "parquet": summary.parquet,
+            "pipeline": summary.pipeline,
+        },
+    )
+    return 0
+
+
+def _parse_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise argparse.ArgumentTypeError("timestamp must include a UTC offset")
+    return parsed
+
+
+async def run_replay(
+    settings: Settings,
+    *,
+    input_path: Path,
+    start: datetime | None,
+    end: datetime | None,
+    exchanges: list[str] | None,
+    symbols: list[str] | None,
+    channels: list[str] | None,
+    order: ReplayOrder,
+    speed: float | None,
+) -> int:
+    """Replay retained raw records without exchange connectivity."""
+
+    from cvf.pipeline import NormalizedEventBus
+
+    bus = NormalizedEventBus(
+        default_queue_capacity=settings.pipeline.consumer_queue_capacity
+    )
+    reader = RawParquetReader(input_path)
+    filters = RawScanFilter(
+        start=start,
+        end=end,
+        exchanges=(
+            None if not exchanges else frozenset(Exchange(value) for value in exchanges)
+        ),
+        symbols=None if not symbols else frozenset(symbols),
+        channels=None if not channels else frozenset(channels),
+    )
+    runner = ReplayRunner(
+        event_bus=bus,
+        order=order,
+        speed=settings.replay.default_speed if speed is None else speed,
+    )
+    summary = await runner.run(reader.iter_records(filters=filters, order=order))
+    logging.getLogger("cvf").info(
+        "raw replay complete",
+        extra={
+            "event": "replay_complete",
+            "input_path": str(input_path.resolve()),
+            **asdict(summary),
         },
     )
     return 0
@@ -212,6 +271,40 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="Override storage.raw_data_path for this collection",
     )
+    replay = subparsers.add_parser(
+        "replay",
+        help="Offline deterministic replay of retained raw Parquet",
+    )
+    replay.add_argument("--config", type=Path)
+    replay.add_argument("--input", type=Path, required=True)
+    replay.add_argument("--start", type=_parse_timestamp)
+    replay.add_argument("--end", type=_parse_timestamp)
+    replay.add_argument(
+        "--exchange",
+        action="append",
+        choices=[Exchange.BINANCE.value, Exchange.OKX.value],
+    )
+    replay.add_argument("--symbol", action="append")
+    replay.add_argument("--channel", action="append")
+    replay.add_argument(
+        "--order",
+        type=ReplayOrder,
+        choices=list(ReplayOrder),
+        default=ReplayOrder.EVENT_TIME,
+    )
+    replay.add_argument(
+        "--speed",
+        type=float,
+        help="Replay multiplier; 0 is fastest and performs no wall-clock sleeps",
+    )
+    compact = subparsers.add_parser(
+        "compact-raw",
+        help="Compact raw Parquet into a separately audited output tree",
+    )
+    compact.add_argument("--config", type=Path)
+    compact.add_argument("--input", type=Path, required=True)
+    compact.add_argument("--output", type=Path, required=True)
+    compact.add_argument("--target-rows", type=int, default=100_000)
     return parser
 
 
@@ -235,6 +328,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                     output_path=args.output,
                 )
             )
+        if args.command == "replay":
+            return asyncio.run(
+                run_replay(
+                    settings,
+                    input_path=args.input,
+                    start=args.start,
+                    end=args.end,
+                    exchanges=args.exchange,
+                    symbols=args.symbol,
+                    channels=args.channel,
+                    order=args.order,
+                    speed=args.speed,
+                )
+            )
+        if args.command == "compact-raw":
+            report = compact_raw_tree(
+                args.input,
+                args.output,
+                target_rows=args.target_rows,
+            )
+            logging.getLogger("cvf").info(
+                "raw compaction complete",
+                extra={
+                    "event": "raw_compaction_complete",
+                    "input_path": str(report.input_path),
+                    "output_path": str(report.output_path),
+                    "before": asdict(report.before),
+                    "after": asdict(report.after),
+                },
+            )
+            return 0
         return asyncio.run(run(settings, once=args.once))
     except (OSError, RuntimeError, ValueError) as exc:
         logging.getLogger("cvf").exception(

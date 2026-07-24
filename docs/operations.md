@@ -1,4 +1,4 @@
-# CVF-01 Phase-2 Operations
+# CVF-01 Phase-2/2.5 Operations
 
 ## Install and preflight
 
@@ -96,6 +96,29 @@ The validator scans payloads in bounded batches, opens every Parquet file, check
 columns, unique UUIDs, nonempty exact payload bytes, `raw://<record_id>` lineage,
 row/partition agreement, and the absence of unfinished `.tmp` files. Add
 `--expected-rows N` when reconciling against the final `collection_complete` record.
+
+## Offline replay
+
+```powershell
+.\.venv\Scripts\python.exe -m cvf replay --input data\raw --speed 0
+```
+
+Replay is network-free. It retains raw lineage and connection generations, supports bounded
+filters, and uses a stable tie-break rule after event time or local receive time. A positive
+speed preserves recorded timing; zero runs as fast as processing allows.
+
+## Raw compaction
+
+```powershell
+.\.venv\Scripts\python.exe -m cvf compact-raw `
+  --input data\raw `
+  --output data\raw_compacted `
+  --target-rows 100000
+```
+
+Input and output must be disjoint, and a nonempty output is rejected. The command audits both
+trees and succeeds only when row count, UUID uniqueness, exact content digest, payload bytes,
+lineage, and partitions agree. The source tree remains read-only.
 
 ## Current official protocol decisions
 

@@ -15,6 +15,7 @@ from cvf.exchanges.binance import BinanceMarketDataConnector
 from cvf.exchanges.okx import OKXMarketDataConnector
 from cvf.monitoring import StreamHealthRegistry, StreamHealthSnapshot, StreamKey
 from cvf.normalization.common import NormalizedMarketEvent
+from cvf.pipeline import ConsumerStats, NormalizedEventBus
 from cvf.storage import AsyncPartitionedParquetWriter, ParquetWriterStats, RawMarketRecord
 
 
@@ -30,6 +31,7 @@ class CollectionSummary:
     normalized_event_counts: dict[str, int]
     health_status_counts: dict[str, int]
     parquet: ParquetWriterStats
+    pipeline: dict[str, ConsumerStats]
 
     @property
     def duration_seconds(self) -> float:
@@ -44,6 +46,7 @@ class MarketDataCollector:
         settings: Settings,
         *,
         output_path: Path | None = None,
+        event_bus: NormalizedEventBus | None = None,
     ) -> None:
         self.settings = settings
         self.output_path = (output_path or settings.storage.raw_data_path).resolve()
@@ -56,6 +59,9 @@ class MarketDataCollector:
             channel_stale_after_ms=settings.health.channel_stale_after_ms,
         )
         self._event_counts: Counter[str] = Counter()
+        self._event_bus = event_bus or NormalizedEventBus(
+            default_queue_capacity=settings.pipeline.consumer_queue_capacity
+        )
         self._writer = AsyncPartitionedParquetWriter(
             root_path=self.output_path,
             batch_rows=settings.storage.parquet_batch_rows,
@@ -101,6 +107,7 @@ class MarketDataCollector:
 
     async def _record_event(self, event: NormalizedMarketEvent) -> None:
         self._event_counts[event.event_type.value] += 1
+        await self._event_bus.publish(event)
 
     def _record_backpressure(self, record: RawMarketRecord) -> None:
         key = StreamKey(record.exchange, record.symbol, record.channel)
@@ -142,7 +149,12 @@ class MarketDataCollector:
         if duration_seconds is not None and duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive")
         started_at = datetime.now(UTC)
-        await self._writer.start()
+        await self._event_bus.start()
+        try:
+            await self._writer.start()
+        except Exception:
+            await self._event_bus.close()
+            raise
         monitor_tasks: list[asyncio.Task[None]] = []
         status_task: asyncio.Task[None] | None = None
         timer_task: asyncio.Task[None] | None = None
@@ -210,7 +222,10 @@ class MarketDataCollector:
                 *cleanup_tasks,
                 return_exceptions=True,
             )
-            await self._writer.close()
+            try:
+                await self._writer.close()
+            finally:
+                await self._event_bus.close()
         finished_at = datetime.now(UTC)
         statuses = Counter(snapshot.status.value for snapshot in terminal_snapshots)
         return CollectionSummary(
@@ -220,4 +235,5 @@ class MarketDataCollector:
             normalized_event_counts=dict(self._event_counts),
             health_status_counts=dict(statuses),
             parquet=self._writer.stats,
+            pipeline=self._event_bus.stats,
         )

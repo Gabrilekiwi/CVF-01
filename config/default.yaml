@@ -197,6 +197,10 @@ storage:
   database_batch_rows: 500
   database_flush_seconds: 1
 
+pipeline:
+  consumer_queue_capacity: 10000
+  backpressure_policy: "block"
+
 logging:
   level: "INFO"
   json_output: true
