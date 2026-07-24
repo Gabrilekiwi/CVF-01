@@ -1,0 +1,17 @@
+{
+  "arg": {
+    "channel": "index-tickers",
+    "instId": "BTC-USDT"
+  },
+  "data": [
+    {
+      "instId": "BTC-USDT",
+      "idxPx": "64977.4",
+      "high24h": "66000",
+      "sodUtc0": "64000",
+      "open24h": "64200",
+      "low24h": "63000",
+      "ts": "1784851580000"
+    }
+  ]
+}

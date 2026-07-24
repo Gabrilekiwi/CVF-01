@@ -3,7 +3,7 @@
 ## 1. Research status
 
 All weights and thresholds are initial research hypotheses, not evidence of profitability.
-Phase 1 stores them as validated configuration but does not calculate signals. Evaluation must
+Phase 2 stores them as validated configuration but does not calculate signals. Evaluation must
 include fees, depth-based slippage, funding, latency, data gaps, and regime segmentation before
 any parameter is considered useful.
 
@@ -212,4 +212,3 @@ cost components, holding time, venue/symbol/regime breakdown, and parameter sens
 Parameter selection must use train/validation/test time splits and include an embargo where
 overlapping windows could leak information. Results are rejected if timestamp alignment,
 book reconstruction, or raw-data completeness cannot be demonstrated.
-

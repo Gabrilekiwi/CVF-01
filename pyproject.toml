@@ -4,15 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cvf-01"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cross-venue short-term flow research and paper-trading system"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "Proprietary" }
+license = "LicenseRef-Proprietary"
 authors = [{ name = "CVF-01 Contributors" }]
 dependencies = [
+    "httpx>=0.27,<1",
     "pydantic>=2.10,<3",
+    "pyarrow>=18,<26",
     "PyYAML>=6.0,<7",
+    "websockets>=14,<17",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +27,7 @@ storage = [
     "SQLAlchemy>=2.0,<3",
     "aiosqlite>=0.20,<1",
     "asyncpg>=0.30,<1",
-    "pyarrow>=18,<22",
+    "pyarrow>=18,<26",
 ]
 analytics = [
     "numpy>=2.1,<3",

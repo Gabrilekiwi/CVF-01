@@ -190,6 +190,7 @@ def test_all_normalized_models_expose_required_event_metadata() -> None:
         "symbol",
         "exchange_timestamp",
         "local_receive_timestamp",
+        "normalization_timestamp",
         "event_type",
         "sequence_id",
         "raw_payload_reference",

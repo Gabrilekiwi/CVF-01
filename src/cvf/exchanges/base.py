@@ -15,7 +15,7 @@ from cvf.models.market import ExchangeHealth
 
 
 class ConnectorNotImplementedError(NotImplementedError):
-    """Raised when a phase-1 connector skeleton is asked to access the network."""
+    """Compatibility error retained for downstream phase-1 callers."""
 
 
 class PlannedSubscription(FrozenModel):
@@ -55,7 +55,7 @@ class ExchangeConnector(ABC):
 
     @abstractmethod
     async def connect(self) -> None:
-        """Connect and subscribe. Phase-1 implementations fail explicitly."""
+        """Connect and subscribe to public market data."""
 
     async def disconnect(self) -> None:
         """Release connector resources and mark the connector disconnected."""
@@ -102,7 +102,7 @@ class ExchangeConnector(ABC):
             open_interest_stale=self._last_event_timestamp is None,
             last_error=self._last_error,
             details={
-                "phase": "connector_skeleton",
+                "mode": "offline_plan",
                 "planned_subscription_count": len(self.planned_subscriptions()),
                 "network_attempted": False,
             },

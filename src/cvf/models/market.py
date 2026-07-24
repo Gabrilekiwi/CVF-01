@@ -34,11 +34,24 @@ class Trade(EventBase):
     trade_id: str
     price: PositiveDecimal
     quantity: PositiveDecimal
+    contract_quantity: PositiveDecimal | None = None
     aggressor_side: AggressorSide
 
     @property
     def notional(self) -> Decimal:
         return self.price * self.quantity
+
+    @property
+    def base_quantity(self) -> Decimal:
+        """Normalized quantity in base-asset units."""
+
+        return self.quantity
+
+    @property
+    def quote_notional(self) -> Decimal:
+        """Trade notional in quote-asset units."""
+
+        return self.notional
 
 
 class OrderBookSnapshot(EventBase):
@@ -47,19 +60,18 @@ class OrderBookSnapshot(EventBase):
     asks: list[OrderBookLevel] = Field(min_length=1)
     depth: int = Field(ge=1)
     checksum: str | None = None
+    generation: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_book(self) -> OrderBookSnapshot:
         if len(self.bids) > self.depth or len(self.asks) > self.depth:
             raise ValueError("book sides cannot contain more levels than depth")
         if any(
-            left.price <= right.price
-            for left, right in zip(self.bids, self.bids[1:], strict=False)
+            left.price <= right.price for left, right in zip(self.bids, self.bids[1:], strict=False)
         ):
             raise ValueError("bids must be strictly descending by price")
         if any(
-            left.price >= right.price
-            for left, right in zip(self.asks, self.asks[1:], strict=False)
+            left.price >= right.price for left, right in zip(self.asks, self.asks[1:], strict=False)
         ):
             raise ValueError("asks must be strictly ascending by price")
         if self.bids[0].price >= self.asks[0].price:
@@ -73,6 +85,7 @@ class OrderBookUpdate(EventBase):
     asks: list[OrderBookLevel] = Field(default_factory=list)
     previous_sequence_id: int | str | None = None
     checksum: str | None = None
+    generation: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def update_is_not_empty(self) -> OrderBookUpdate:
@@ -135,22 +148,48 @@ class LiquidationEvent(EventBase):
     position_side: LiquidatedPositionSide
     price: PositiveDecimal
     quantity: PositiveDecimal
+    contract_quantity: PositiveDecimal | None = None
 
     @property
     def notional(self) -> Decimal:
         return self.price * self.quantity
 
+    @property
+    def base_quantity(self) -> Decimal:
+        """Normalized liquidation quantity in base-asset units."""
+
+        return self.quantity
+
+    @property
+    def quote_notional(self) -> Decimal:
+        """Liquidated notional in quote-asset units."""
+
+        return self.notional
+
 
 class ExchangeHealth(EventBase):
     event_type: Literal[EventType.EXCHANGE_HEALTH] = EventType.EXCHANGE_HEALTH
+    channel: str = "*"
     status: HealthStatus
     is_connected: bool
     last_event_timestamp: datetime | None = None
     last_latency_ms: float | None = None
+    average_latency_ms: float | None = None
+    maximum_latency_ms: float | None = None
+    last_normalization_latency_ms: float | None = None
     clock_skew_ms: float | None = None
+    messages_received: int = Field(default=0, ge=0)
     duplicate_events: int = Field(default=0, ge=0)
+    sequence_gaps: int = Field(default=0, ge=0)
+    checksum_failures: int = Field(default=0, ge=0)
+    reconnects: int = Field(default=0, ge=0)
+    resubscriptions: int = Field(default=0, ge=0)
+    parse_errors: int = Field(default=0, ge=0)
+    dropped_events: int = Field(default=0, ge=0)
+    backpressure_events: int = Field(default=0, ge=0)
     sequence_gap_detected: bool = False
     resyncing: bool = False
+    book_generation: int = Field(default=0, ge=0)
     rest_healthy: bool = True
     open_interest_stale: bool = False
     last_error: str | None = None
@@ -162,6 +201,13 @@ class ExchangeHealth(EventBase):
         if value is None:
             return value
         return EventBase.timestamp_is_timezone_aware(value)
+
+    @field_validator("channel")
+    @classmethod
+    def channel_is_not_empty(cls, value: str) -> str:
+        if not value or value.isspace():
+            raise ValueError("channel cannot be empty")
+        return value
 
     @model_validator(mode="after")
     def state_fields_are_consistent(self) -> ExchangeHealth:
