@@ -1,9 +1,9 @@
 # Cross-Venue Short-Term Flow Strategy (CVF-01)
 
 CVF-01 is a research-first, paper-trading-only system for short-horizon Binance and OKX
-USDT perpetual signals. Phase 3A adds the bounded state and window foundation used by both
-live processing and replay. It still does not calculate strategy factors, generate signals,
-or place orders.
+USDT perpetual signals. Phase 3B adds deterministic single-venue feature calculations over the
+bounded state shared by live processing and replay. It still does not score markets, generate
+signals, or place orders.
 
 ## Current status
 
@@ -44,8 +44,20 @@ Phase 3A additionally includes:
 - a versioned typed `FeatureSnapshot` schema that cannot hide missing values as zero;
 - the same feature-state consumer registered in live collection and offline replay.
 
-Phase 3B–D calculations and persistence, scoring, signals, paper trading, private APIs, and
-real orders remain unimplemented.
+Phase 3B additionally includes:
+
+- deterministic 5-second, 15-second, and 60-second single-venue snapshots;
+- trade-flow notional, taker imbalance, impulses, average size, and large-trade share;
+- weighted depth, liquidity additions/removals, recovery rate, spread, microprice,
+  depth-walk slippage, OFI, and venue-local Z-scores;
+- returns, realized volatility, one-second-bucket ATR, trailing extremes, and jump flags;
+- OI change/age and price/OI regime, funding/premium crowding state, and explicitly labeled
+  public-sample liquidation activity;
+- deterministic feature IDs, strict decision-time source bounds, and explicit rejection of a
+  book containing post-decision updates.
+
+Phase 3C–D cross-venue calculations and persistence, scoring, signals, paper trading, private
+APIs, and real orders remain unimplemented.
 
 ## Safety boundary
 
@@ -189,7 +201,7 @@ src/cvf/
   clock/                 live/replay clock and deterministic scheduler
   replay/                raw scanning, ordering, normalization, replay runner
   models/                immutable normalized records
-  features/              bounded Phase-3 state, availability, typed snapshot contracts
+  features/              bounded state, availability, typed snapshots, venue features
   strategy/              Phase-4+ boundary; not active
 tests/                   unit/integration tests and versioned payload fixtures
 data/raw/                ignored runtime collection output
@@ -216,8 +228,10 @@ and [OKX API v5 documentation](https://www.okx.com/docs-v5/en/). See
    compaction audit, and CI.
 3. **Phase 3A (implemented):** bounded venue/symbol state, late-event rules, book-generation
    reset, feature availability, and typed snapshot schema.
-4. **Phase 3B–D:** per-venue and cross-venue features plus feature persistence.
-5. **Phase 4:** scores and entry/exit/hold/no-trade signals.
-6. **Phase 5:** order-book-based paper fills and risk controls.
-7. **Phase 6:** backtests, evaluation, and parameter sensitivity.
-8. **Phase 7:** a small monitoring dashboard.
+4. **Phase 3B (implemented):** deterministic single-venue trade, book, price, OI, crowding,
+   and public-sample liquidation features.
+5. **Phase 3C–D:** cross-venue features plus feature persistence.
+6. **Phase 4:** scores and entry/exit/hold/no-trade signals.
+7. **Phase 5:** order-book-based paper fills and risk controls.
+8. **Phase 6:** backtests, evaluation, and parameter sensitivity.
+9. **Phase 7:** a small monitoring dashboard.

@@ -2,9 +2,11 @@
 
 from cvf.features.availability import FeatureAvailability, evaluate_availability
 from cvf.features.models import (
+    CrowdingState,
     FeatureSnapshot,
     FeatureUnavailableCode,
     FeatureUnavailableReason,
+    PriceOpenInterestState,
 )
 from cvf.features.pipeline import FeatureStatePipeline, FeatureStatePipelineStats
 from cvf.features.rolling import (
@@ -14,6 +16,7 @@ from cvf.features.rolling import (
     TimedValue,
     WindowStats,
 )
+from cvf.features.single_venue import SingleVenueFeatureEngine
 from cvf.features.state import (
     FeatureBookView,
     FeatureOrderBookState,
@@ -26,6 +29,7 @@ from cvf.features.state import (
 __all__ = [
     "AppendStatus",
     "BoundedTimeWindow",
+    "CrowdingState",
     "FeatureAvailability",
     "FeatureBookView",
     "FeatureOrderBookState",
@@ -36,6 +40,8 @@ __all__ = [
     "FeatureUnavailableReason",
     "LateEventPolicy",
     "MarketStateStore",
+    "PriceOpenInterestState",
+    "SingleVenueFeatureEngine",
     "StateUpdateResult",
     "StateUpdateStatus",
     "TimedValue",

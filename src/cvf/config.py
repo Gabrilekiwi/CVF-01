@@ -7,6 +7,7 @@ import math
 import os
 import sys
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
@@ -123,6 +124,9 @@ class FeaturesConfig(FrozenConfigModel):
     late_event_policy: Literal["drop", "insert"] = "drop"
     maximum_lateness_ms: int = Field(default=250, ge=0)
     book_pending_updates: int = Field(default=10_000, gt=0)
+    large_trade_notional_usdt: Decimal = Field(default=Decimal("100000"), gt=0)
+    depth_walk_notional_usdt: Decimal = Field(default=Decimal("10000"), gt=0)
+    abnormal_jump_zscore: float = Field(default=4.0, gt=0)
 
     @model_validator(mode="after")
     def validate_depth_weights(self) -> FeaturesConfig:

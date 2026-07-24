@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from cvf.features.models import FeatureUnavailableCode, FeatureUnavailableReason
 from cvf.features.state import VenueSymbolState
-from cvf.models.enums import EventType, HealthStatus
+from cvf.models.enums import HealthStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +41,7 @@ def evaluate_availability(
         raise ValueError("open_interest_stale_after must be positive")
     reasons: list[FeatureUnavailableReason] = []
 
-    if not state.trades:
+    if not any(item.timestamp <= decision_at for item in state.trades):
         reasons.append(
             FeatureUnavailableReason(
                 code=FeatureUnavailableCode.NO_TRADES,
@@ -66,7 +66,14 @@ def evaluate_availability(
                 channel="order_book",
             )
         )
-    latest_oi = state.latest_by_type.get(EventType.OPEN_INTEREST)
+    latest_oi = next(
+        (
+            item.value
+            for item in reversed(list(state.open_interest))
+            if item.timestamp <= decision_at
+        ),
+        None,
+    )
     if latest_oi is None:
         reasons.append(
             FeatureUnavailableReason(

@@ -95,6 +95,9 @@ features:
   late_event_policy: "drop"
   maximum_lateness_ms: 250
   book_pending_updates: 10000
+  large_trade_notional_usdt: 100000
+  depth_walk_notional_usdt: 10000
+  abnormal_jump_zscore: 4.0
 
 scoring:
   exchange_factor_weights:

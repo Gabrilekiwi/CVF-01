@@ -27,6 +27,20 @@ class FeatureUnavailableCode(StrEnum):
     TIME_ALIGNMENT = "TIME_ALIGNMENT"
 
 
+class PriceOpenInterestState(StrEnum):
+    PRICE_UP_OI_UP = "PRICE_UP_OI_UP"
+    PRICE_UP_OI_DOWN = "PRICE_UP_OI_DOWN"
+    PRICE_DOWN_OI_UP = "PRICE_DOWN_OI_UP"
+    PRICE_DOWN_OI_DOWN = "PRICE_DOWN_OI_DOWN"
+    FLAT = "FLAT"
+
+
+class CrowdingState(StrEnum):
+    CROWDED_LONG = "CROWDED_LONG"
+    CROWDED_SHORT = "CROWDED_SHORT"
+    MIXED = "MIXED"
+
+
 class FeatureUnavailableReason(FrozenModel):
     code: FeatureUnavailableCode
     detail: str
@@ -42,6 +56,7 @@ class TradeFlowFeatureValues(FrozenModel):
     aggressive_buy_notional: Decimal | None = None
     aggressive_sell_notional: Decimal | None = None
     taker_imbalance: float | None = None
+    taker_imbalance_zscore: float | None = None
     trade_notional_impulse: float | None = None
     trade_count_impulse: float | None = None
     average_trade_notional: Decimal | None = None
@@ -49,6 +64,7 @@ class TradeFlowFeatureValues(FrozenModel):
 
     @field_validator(
         "taker_imbalance",
+        "taker_imbalance_zscore",
         "trade_notional_impulse",
         "trade_count_impulse",
         "large_trade_share",
@@ -61,6 +77,11 @@ class TradeFlowFeatureValues(FrozenModel):
 class OrderBookFeatureValues(FrozenModel):
     weighted_bid_depth: Decimal | None = None
     weighted_ask_depth: Decimal | None = None
+    bid_liquidity_change: Decimal | None = None
+    ask_liquidity_change: Decimal | None = None
+    added_liquidity_quantity: Decimal | None = None
+    removed_liquidity_quantity: Decimal | None = None
+    liquidity_recovery_quantity_per_second: float | None = None
     depth_imbalance: float | None = None
     spread: Decimal | None = None
     relative_spread: float | None = None
@@ -78,6 +99,7 @@ class OrderBookFeatureValues(FrozenModel):
         "sell_slippage_bps",
         "order_flow_imbalance",
         "order_flow_imbalance_zscore",
+        "liquidity_recovery_quantity_per_second",
     )
     @classmethod
     def finite_float(cls, value: float | None) -> float | None:
@@ -110,6 +132,7 @@ class OpenInterestFeatureValues(FrozenModel):
     percentage_change: float | None = None
     zscore: float | None = None
     data_age_ms: float | None = None
+    price_oi_state: PriceOpenInterestState | None = None
 
     @field_validator("percentage_change", "zscore", "data_age_ms")
     @classmethod
@@ -122,8 +145,15 @@ class CrowdingFeatureValues(FrozenModel):
     funding_zscore: float | None = None
     mark_index_premium: float | None = None
     premium_zscore: float | None = None
+    taker_bias: float | None = None
+    joint_state: CrowdingState | None = None
 
-    @field_validator("funding_zscore", "mark_index_premium", "premium_zscore")
+    @field_validator(
+        "funding_zscore",
+        "mark_index_premium",
+        "premium_zscore",
+        "taker_bias",
+    )
     @classmethod
     def finite_float(cls, value: float | None) -> float | None:
         return _finite(value)
@@ -133,6 +163,7 @@ class LiquidationFeatureValues(FrozenModel):
     public_sample_long_notional: Decimal | None = None
     public_sample_short_notional: Decimal | None = None
     public_sample_activity_zscore: float | None = None
+    activity_with_oi_decline: bool | None = None
 
     @field_validator("public_sample_activity_zscore")
     @classmethod

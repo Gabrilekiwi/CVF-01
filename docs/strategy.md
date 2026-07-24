@@ -3,9 +3,9 @@
 ## 1. Research status
 
 All weights and thresholds are initial research hypotheses, not evidence of profitability.
-Phase 2 stores them as validated configuration but does not calculate signals. Evaluation must
-include fees, depth-based slippage, funding, latency, data gaps, and regime segmentation before
-any parameter is considered useful.
+Phase 3B calculates single-venue observations but does not calculate market scores or signals.
+Evaluation must include fees, depth-based slippage, funding, latency, data gaps, and regime
+segmentation before any parameter is considered useful.
 
 ## 2. Universe and cadence
 
@@ -42,8 +42,12 @@ The first five levels use weights `1.0, 0.8, 0.6, 0.4, 0.2`. Outputs include wei
 depth, depth imbalance, spread, mid, microprice, depth-walk slippage, cancellation change, and
 simplified order-flow imbalance (OFI).
 
-OFI distinguishes price-level additions/removals from liquidity consumed by aggressive trades.
-It is calculated only from a sequence-valid local book.
+OFI reflects signed price-level additions/removals and is calculated only from a sequence-valid
+local book.
+
+The implemented removal quantity is an observable book-change proxy; public depth updates alone
+cannot attribute every removal to cancellation versus execution. Recovery rate is additions
+observed after the first removal in the window, divided by elapsed seconds.
 
 ### 3.3 Price impulse
 
