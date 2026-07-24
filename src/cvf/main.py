@@ -1,4 +1,4 @@
-"""Minimal phase-1 process entry point."""
+"""Offline inspection and explicit phase-2 collection entry points."""
 
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ def _install_shutdown_handlers(
 
 
 async def run(settings: Settings, *, once: bool = False) -> int:
-    """Initialize the phase-1 application and wait for a clean shutdown."""
+    """Run the network-free configuration and connector-plan process."""
 
     logger = logging.getLogger("cvf")
     connectors = build_connectors(settings)
@@ -142,10 +142,45 @@ async def run(settings: Settings, *, once: bool = False) -> int:
     return 0
 
 
+async def run_collection(
+    settings: Settings,
+    *,
+    duration_seconds: float | None,
+    output_path: Path | None,
+) -> int:
+    """Run explicit public collection until duration or shutdown signal."""
+
+    from cvf.collector import MarketDataCollector
+
+    logger = logging.getLogger("cvf")
+    stop_event = asyncio.Event()
+    restore_handlers = _install_shutdown_handlers(stop_event, logger)
+    collector = MarketDataCollector(settings, output_path=output_path)
+    try:
+        summary = await collector.run(
+            stop_event=stop_event,
+            duration_seconds=duration_seconds,
+        )
+    finally:
+        restore_handlers()
+    logger.info(
+        "market-data collection complete",
+        extra={
+            "event": "collection_complete",
+            "duration_seconds": summary.duration_seconds,
+            "output_path": summary.output_path,
+            "normalized_event_counts": summary.normalized_event_counts,
+            "health_status_counts": summary.health_status_counts,
+            "parquet": summary.parquet,
+        },
+    )
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cvf",
-        description="CVF-01 phase-1 configuration and connector health check",
+        description="CVF-01 offline inspection and public market-data collection",
     )
     parser.add_argument(
         "--config",
@@ -155,7 +190,27 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Print subscription plans and health once, then exit",
+        help="Print plans and disconnected health once without network access",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    collect = subparsers.add_parser(
+        "collect",
+        help="Explicitly collect Binance and OKX public market data",
+    )
+    collect.add_argument(
+        "--config",
+        type=Path,
+        help="Optional YAML overlay merged on top of config/default.yaml",
+    )
+    collect.add_argument(
+        "--duration",
+        type=float,
+        help="Stop cleanly after this many seconds; omit to run until a signal",
+    )
+    collect.add_argument(
+        "--output",
+        type=Path,
+        help="Override storage.raw_data_path for this collection",
     )
     return parser
 
@@ -172,7 +227,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     configure_logging(settings.logging.level, json_output=settings.logging.json_output)
     try:
+        if args.command == "collect":
+            return asyncio.run(
+                run_collection(
+                    settings,
+                    duration_seconds=args.duration,
+                    output_path=args.output,
+                )
+            )
         return asyncio.run(run(settings, once=args.once))
+    except (OSError, RuntimeError, ValueError) as exc:
+        logging.getLogger("cvf").exception(
+            "CVF-01 command failed",
+            extra={"event": "command_failed"},
+        )
+        print(f"CVF-01 error: {exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         return 130
 

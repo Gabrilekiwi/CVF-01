@@ -25,23 +25,30 @@ exchanges:
   binance:
     enabled: true
     rest_url: "https://fapi.binance.com"
-    public_websocket_url: "wss://fstream.binance.com/ws"
+    public_websocket_url: "wss://fstream.binance.com"
     symbols:
       BTC-USDT-PERP: "BTCUSDT"
       ETH-USDT-PERP: "ETHUSDT"
     channels:
       - "aggTrade"
       - "bookTicker"
-      - "depth5@100ms"
+      - "depth@100ms"
       - "markPrice@1s"
       - "forceOrder"
     rest_pollers:
       - "open_interest"
     heartbeat_timeout_seconds: 30
+    connect_timeout_seconds: 10
+    close_timeout_seconds: 5
+    receive_timeout_seconds: 20
+    rest_timeout_seconds: 10
     reconnect_initial_seconds: 1
     reconnect_max_seconds: 60
     reconnect_jitter_seconds: 0.5
+    reconnect_stable_reset_seconds: 60
     open_interest_poll_seconds: 5
+    book_snapshot_depth: 1000
+    book_buffer_events: 10000
   okx:
     enabled: true
     rest_url: "https://www.okx.com"
@@ -51,7 +58,7 @@ exchanges:
       ETH-USDT-PERP: "ETH-USDT-SWAP"
     channels:
       - "trades"
-      - "books5"
+      - "books"
       - "open-interest"
       - "funding-rate"
       - "mark-price"
@@ -60,10 +67,17 @@ exchanges:
     rest_pollers:
       - "instrument_metadata"
     heartbeat_timeout_seconds: 30
+    connect_timeout_seconds: 10
+    close_timeout_seconds: 5
+    receive_timeout_seconds: 20
+    rest_timeout_seconds: 10
     reconnect_initial_seconds: 1
     reconnect_max_seconds: 60
     reconnect_jitter_seconds: 0.5
+    reconnect_stable_reset_seconds: 60
     open_interest_poll_seconds: 5
+    book_snapshot_depth: 1000
+    book_buffer_events: 10000
 
 features:
   order_book_depth: 5
@@ -149,6 +163,24 @@ health:
   stale_after_ms: 1500
   clock_skew_warning_ms: 250
   duplicate_cache_size: 10000
+  duplicate_ttl_seconds: 300
+  open_interest_stale_after_ms: 15000
+  channel_stale_after_ms:
+    aggTrade: 1500
+    bookTicker: 1500
+    depth@100ms: 1500
+    markPrice@1s: 3000
+    forceOrder: null
+    open_interest: 15000
+    trades: 1500
+    books: 1500
+    books5: 1500
+    open-interest: 15000
+    funding-rate: 120000
+    mark-price: 3000
+    index-tickers: 3000
+    liquidation-orders: null
+    instrument_metadata: null
   order_book_gap_forces_resync: true
   block_entry_statuses:
     - "STALE"
@@ -161,6 +193,7 @@ storage:
   processed_data_path: "data/processed"
   parquet_batch_rows: 10000
   parquet_flush_seconds: 5
+  parquet_queue_capacity: 50000
   database_batch_rows: 500
   database_flush_seconds: 1
 
@@ -172,4 +205,3 @@ replay:
   preserve_receive_timestamps: true
   default_speed: 1.0
   deterministic_seed: 20260723
-

@@ -23,6 +23,7 @@ Every normalized market, health, feature, signal, and paper-trading event inheri
 | `symbol` | string | no | Canonical symbol; `*` is allowed only for exchange-wide health |
 | `exchange_timestamp` | UTC datetime | no | Venue-declared event time, or decision/event clock for derived records |
 | `local_receive_timestamp` | UTC datetime | no | First local observation time |
+| `normalization_timestamp` | UTC datetime | no | Time normalized construction began/completed |
 | `event_type` | enum | no | Stable normalized record discriminator |
 | `sequence_id` | integer/string | yes | Venue sequence/trade/update identifier when available |
 | `raw_payload_reference` | string | yes | URI/path plus optional row locator in raw storage |
@@ -37,6 +38,7 @@ Every normalized market, health, feature, signal, and paper-trading event inheri
 | `trade_id` | string | Venue trade/aggregate-trade identifier |
 | `price` | positive decimal | Execution price in quote per base |
 | `quantity` | positive decimal | Normalized base quantity; conversion must be documented |
+| `contract_quantity` | positive decimal | Venue contract quantity when the venue reports contracts |
 | `aggressor_side` | `BUY`/`SELL` | Side that crossed the spread |
 | `notional` | computed decimal | `price * quantity` |
 
@@ -51,6 +53,7 @@ Every normalized market, health, feature, signal, and paper-trading event inheri
 
 `bids` are strictly descending, `asks` strictly ascending, and best bid must be below best ask.
 `depth` states the intended retained depth; `checksum` is nullable and venue-specific.
+`generation` increments whenever local continuity is invalidated.
 
 ### `OrderBookUpdate`
 
@@ -100,8 +103,15 @@ activity samples and not complete liquidation totals.
 | `is_connected` | Transport connection state |
 | `last_event_timestamp` | Most recent valid exchange event time |
 | `last_latency_ms` | Most recent observed receive latency |
+| `average_latency_ms`, `maximum_latency_ms` | Running adjusted latency statistics |
+| `last_normalization_latency_ms` | Most recent local normalization time |
 | `clock_skew_ms` | Estimated venue/local clock difference |
+| `messages_received` | Accepted normalized events |
 | `duplicate_events` | Count in the current observation scope |
+| `sequence_gaps`, `checksum_failures` | Lifetime continuity failures |
+| `reconnects`, `resubscriptions` | Lifecycle recovery counters |
+| `parse_errors`, `dropped_events`, `backpressure_events` | Ingestion/storage diagnostics |
+| `book_generation` | Current local-book generation |
 | `sequence_gap_detected` | Whether continuity failed |
 | `resyncing` | Whether snapshot/state recovery is active |
 | `rest_healthy` | Public REST dependency state |
@@ -170,18 +180,31 @@ quantity, fee, slippage, realized PnL, and execution time.
 | `BTC-USDT-PERP` | `BTCUSDT` | `BTC-USDT-SWAP` | `BTC-USDT` |
 | `ETH-USDT-PERP` | `ETHUSDT` | `ETH-USDT-SWAP` | `ETH-USDT` |
 
-Mapping is exact and fail-closed; phase 1 does not infer unknown symbols.
+Mapping is exact and fail-closed. The OKX index instrument is converted to its configured
+perpetual canonical symbol only inside the index-channel mapping.
 
-## 8. Raw partition target
+## 8. Raw Parquet schema
 
-Planned layout:
+Implemented layout:
 
 ```text
-data/raw/date=YYYY-MM-DD/exchange=BINANCE/symbol=BTC-USDT-PERP/event_type=TRADE/*.parquet
+data/raw/date=YYYY-MM-DD/exchange=BINANCE/symbol=BTC-USDT-PERP/channel=aggTrade/*.parquet
 ```
 
-Minimum raw metadata includes schema version, capture run ID, venue, raw symbol, both
-timestamps, channel, sequence/trade ID, payload bytes or lossless JSON, and parse status.
-Malformed payloads go to an explicit quarantine dataset with an error code; they are never
-silently discarded.
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | int16 | Raw schema, currently `1` |
+| `record_id` | UUID string | Unique row identity |
+| `raw_payload_reference` | string | Stable `raw://<record_id>` lineage key |
+| `exchange`, `symbol`, `channel` | string | Routing and partition metadata |
+| `message_kind` | string | Market data, control, lifecycle, or parse error |
+| `transport` | string | `websocket`, `rest`, or `internal` |
+| `exchange_timestamp` | UTC timestamp | Nullable when the venue supplies none |
+| `local_receive_timestamp` | UTC timestamp | First local receipt |
+| `normalization_timestamp` | UTC timestamp | Nullable for raw-first writes |
+| `sequence_id` | string | Nullable venue sequence/trade ID |
+| `connection_generation` | int64 | WebSocket lifecycle generation |
+| `raw_payload` | binary | Exact received frame or HTTP response bytes |
 
+Malformed WebSocket bytes are persisted under `_unparsed` before the session is recovered.
+Connection lifecycle records use wildcard symbol and `_session_*` channels.

@@ -69,4 +69,3 @@ __all__ = [
     "TradePurpose",
     "TradingSignal",
 ]
-

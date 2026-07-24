@@ -75,10 +75,17 @@ class ExchangeConnectionConfig(FrozenConfigModel):
     channels: list[str] = Field(min_length=1)
     rest_pollers: list[str] = Field(default_factory=list)
     heartbeat_timeout_seconds: float = Field(gt=0)
+    connect_timeout_seconds: float = Field(default=10, gt=0)
+    close_timeout_seconds: float = Field(default=5, gt=0)
+    receive_timeout_seconds: float = Field(default=20, gt=0)
+    rest_timeout_seconds: float = Field(default=10, gt=0)
     reconnect_initial_seconds: float = Field(gt=0)
     reconnect_max_seconds: float = Field(gt=0)
     reconnect_jitter_seconds: float = Field(ge=0)
+    reconnect_stable_reset_seconds: float = Field(default=60, gt=0)
     open_interest_poll_seconds: float = Field(gt=0)
+    book_snapshot_depth: int = Field(default=1_000, ge=100, le=1_000)
+    book_buffer_events: int = Field(default=10_000, gt=0)
 
     @field_validator("symbols")
     @classmethod
@@ -235,8 +242,24 @@ class HealthConfig(FrozenConfigModel):
     stale_after_ms: int = Field(gt=0)
     clock_skew_warning_ms: int = Field(gt=0)
     duplicate_cache_size: int = Field(gt=0)
+    duplicate_ttl_seconds: float = Field(default=300, gt=0)
+    open_interest_stale_after_ms: int = Field(default=15_000, gt=0)
+    channel_stale_after_ms: dict[str, int | None] = Field(default_factory=dict)
     order_book_gap_forces_resync: bool
     block_entry_statuses: list[str]
+
+    @field_validator("channel_stale_after_ms")
+    @classmethod
+    def channel_stale_thresholds_are_valid(
+        cls,
+        value: dict[str, int | None],
+    ) -> dict[str, int | None]:
+        for channel, threshold in value.items():
+            if not channel or channel.isspace():
+                raise ValueError("health channel names cannot be empty")
+            if threshold is not None and threshold <= 0:
+                raise ValueError("channel stale thresholds must be positive or null")
+        return value
 
 
 class StorageConfig(FrozenConfigModel):
@@ -245,6 +268,7 @@ class StorageConfig(FrozenConfigModel):
     processed_data_path: Path
     parquet_batch_rows: int = Field(gt=0)
     parquet_flush_seconds: float = Field(gt=0)
+    parquet_queue_capacity: int = Field(default=50_000, gt=0)
     database_batch_rows: int = Field(gt=0)
     database_flush_seconds: float = Field(gt=0)
 

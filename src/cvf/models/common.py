@@ -29,6 +29,7 @@ class EventBase(FrozenModel):
     symbol: str
     exchange_timestamp: datetime
     local_receive_timestamp: datetime
+    normalization_timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     event_type: EventType
     sequence_id: int | str | None = None
     raw_payload_reference: str | None = None
@@ -38,7 +39,11 @@ class EventBase(FrozenModel):
     def symbol_is_canonical(cls, value: str) -> str:
         return validate_canonical_symbol(value, allow_wildcard=True)
 
-    @field_validator("exchange_timestamp", "local_receive_timestamp")
+    @field_validator(
+        "exchange_timestamp",
+        "local_receive_timestamp",
+        "normalization_timestamp",
+    )
     @classmethod
     def timestamp_is_timezone_aware(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
@@ -57,6 +62,13 @@ class EventBase(FrozenModel):
         """Observed receive latency; may be negative when exchange clocks are skewed."""
 
         delta = self.local_receive_timestamp - self.exchange_timestamp
+        return delta.total_seconds() * 1000.0
+
+    @property
+    def normalization_latency_ms(self) -> float:
+        """Time spent between local receipt and normalized event construction."""
+
+        delta = self.normalization_timestamp - self.local_receive_timestamp
         return delta.total_seconds() * 1000.0
 
 

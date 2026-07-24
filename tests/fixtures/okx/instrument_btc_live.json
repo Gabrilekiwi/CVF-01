@@ -1,0 +1,20 @@
+{
+  "code": "0",
+  "data": [
+    {
+      "ctMult": "1",
+      "ctType": "linear",
+      "ctVal": "0.01",
+      "ctValCcy": "BTC",
+      "instFamily": "BTC-USDT",
+      "instId": "BTC-USDT-SWAP",
+      "instType": "SWAP",
+      "lotSz": "0.01",
+      "minSz": "0.01",
+      "settleCcy": "USDT",
+      "state": "live",
+      "tickSz": "0.1"
+    }
+  ],
+  "msg": ""
+}
