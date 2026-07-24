@@ -1,0 +1,40 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]" build
+      - name: Test
+        run: python -m pytest -q
+      - name: Lint
+        run: python -m ruff check .
+      - name: Type check
+        run: python -m mypy src/cvf
+      - name: Dependency check
+        run: python -m pip check
+      - name: Build wheel
+        run: python -m build
+      - name: Clean wheel smoke test
+        shell: bash
+        run: |
+          python -m venv /tmp/cvf-wheel-smoke
+          /tmp/cvf-wheel-smoke/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/cvf-wheel-smoke/bin/cvf --once

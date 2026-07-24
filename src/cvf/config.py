@@ -273,6 +273,11 @@ class StorageConfig(FrozenConfigModel):
     database_flush_seconds: float = Field(gt=0)
 
 
+class PipelineConfig(FrozenConfigModel):
+    consumer_queue_capacity: int = Field(default=10_000, gt=0)
+    backpressure_policy: Literal["block"] = "block"
+
+
 class LoggingConfig(FrozenConfigModel):
     level: str
     json_output: bool
@@ -305,6 +310,7 @@ class Settings(FrozenConfigModel):
     exits: ExitsConfig
     health: HealthConfig
     storage: StorageConfig
+    pipeline: PipelineConfig
     logging: LoggingConfig
     replay: ReplayConfig
 

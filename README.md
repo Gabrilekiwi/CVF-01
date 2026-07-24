@@ -1,12 +1,12 @@
 # Cross-Venue Short-Term Flow Strategy (CVF-01)
 
 CVF-01 is a research-first, paper-trading-only system for short-horizon Binance and OKX
-USDT perpetual signals. Phase 2 implements public market-data collection only: it does not
-generate factors or signals and cannot place orders.
+USDT perpetual signals. Phase 2.5 adds the deterministic processing, replay, compaction, and
+CI boundaries needed by the feature engine. It still does not generate signals or place orders.
 
 ## Current status
 
-Phase 2 includes:
+The completed Phase 2 data foundation includes:
 
 - Binance USDⓈ-M public WebSocket collection on the current `/public` and `/market` routes;
 - OKX v5 public WebSocket collection with text `ping`/`pong`;
@@ -21,8 +21,18 @@ Phase 2 includes:
 - exact raw payload bytes written through a bounded asynchronous queue to atomic,
   Zstandard-compressed Parquet partitions.
 
-Phase 3 features, scoring, signals, paper trading, private APIs, and real orders are not
-implemented.
+Phase 2.5 additionally includes:
+
+- an ordered normalized-event bus with independent bounded consumer queues;
+- observable consumer backlog, processing latency, backpressure, and fatal failures;
+- UTC live/replay clocks and deterministic 1-second/5-second decision scheduling;
+- filtered raw Parquet reads with stable event-time or receive-time ordering;
+- replay through the same Binance/OKX normalizers and normalized-event bus;
+- read-only-source raw compaction with UUID, content hash, payload, and partition audit;
+- an offline replay/compaction CLI and a GitHub Actions quality/wheel gate.
+
+Phase 3 features, scoring, signals, paper trading, private APIs, and real orders remain
+unimplemented.
 
 ## Safety boundary
 
@@ -99,6 +109,30 @@ Each row contains the exact frame/HTTP response bytes, stable `raw://<uuid>` ref
 transport, route metadata, both timestamps when available, sequence ID, and connection
 generation.
 
+## Offline replay and compaction
+
+Replay retained payloads at maximum speed through the live normalizers and event bus:
+
+```powershell
+python -m cvf replay --input data/raw --speed 0
+```
+
+Use `--start`, `--end`, `--exchange`, `--symbol`, and `--channel` to filter. Choose
+`--order event-time` or `--order receive-time`. A positive `--speed` preserves original
+timing at the requested multiplier.
+
+Compact small raw files into a separate, fully audited tree:
+
+```powershell
+python -m cvf compact-raw `
+  --input data/raw `
+  --output data/raw_compacted `
+  --target-rows 100000
+```
+
+The input tree is never modified. The command fails unless row count, unique UUIDs, exact
+row-content digest, payload bytes, lineage, and partitions agree before and after.
+
 ## Configuration
 
 `config/default.yaml` is merged with an optional overlay and then `CVF__...` environment
@@ -138,8 +172,11 @@ src/cvf/
   orderbook/             exact venue-specific local books
   monitoring/            per-stream health accounting
   storage/               bounded asynchronous raw Parquet writer
+  pipeline/              bounded ordered normalized-event fan-out
+  clock/                 live/replay clock and deterministic scheduler
+  replay/                raw scanning, ordering, normalization, replay runner
   models/                immutable normalized records
-  features/, strategy/   future phase boundaries; not active
+  features/, strategy/   Phase-3+ boundaries; not active
 tests/                   unit/integration tests and versioned payload fixtures
 data/raw/                ignored runtime collection output
 ```
@@ -161,8 +198,10 @@ and [OKX API v5 documentation](https://www.okx.com/docs-v5/en/). See
 
 1. **Phase 2 (implemented):** public collection, normalization, order books, health, raw
    Parquet, recovery, and soak validation.
-2. **Phase 3:** per-venue and cross-venue features.
-3. **Phase 4:** scores and entry/exit/hold/no-trade signals.
-4. **Phase 5:** order-book-based paper fills and risk controls.
-5. **Phase 6:** deterministic replay and backtests.
-6. **Phase 7:** a small monitoring dashboard.
+2. **Phase 2.5 (implemented):** event bus, deterministic clock/scheduler, raw replay,
+   compaction audit, and CI.
+3. **Phase 3:** per-venue and cross-venue features.
+4. **Phase 4:** scores and entry/exit/hold/no-trade signals.
+5. **Phase 5:** order-book-based paper fills and risk controls.
+6. **Phase 6:** backtests, evaluation, and parameter sensitivity.
+7. **Phase 7:** a small monitoring dashboard.

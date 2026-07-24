@@ -2,9 +2,9 @@
 
 ## Scope
 
-CVF-01 remains a modular monolith and paper-trading research system. Phase 2 activates only
-public market-data acquisition and preservation. It contains no credentials, private APIs,
-features, signals, or order execution.
+CVF-01 remains a modular monolith and paper-trading research system. Phase 2.5 activates the
+bounded processing and offline replay boundaries after public acquisition. It contains no
+credentials, private APIs, calculated features, signals, or order execution.
 
 | Area | Phase-2 status |
 |---|---|
@@ -15,7 +15,9 @@ features, signals, or order execution.
 | Lifecycle, heartbeat, recovery, dedupe | Implemented with deterministic transports |
 | Per-stream health and clock-skew accounting | Implemented |
 | Bounded raw Parquet storage | Implemented |
-| Features, signals, trading, replay, UI | Not active |
+| Ordered event bus and deterministic clock/scheduler | Implemented |
+| Raw scan, normalized replay, compaction audit, CI | Implemented |
+| Features, signals, trading, backtests, UI | Not active |
 
 ## Implemented data flow
 
@@ -38,13 +40,25 @@ flowchart LR
     ON --> H
     BB --> H
     OB --> H
-    BN --> NEXT["Phase-3 event boundary"]
-    ON --> NEXT
+    BN --> BUS["Bounded normalized event bus"]
+    ON --> BUS
+    BUS --> NEXT["Phase-3 feature boundary"]
+    PQ --> RR["Stable raw reader"]
+    RR --> RN["Live normalizers"]
+    RN --> BUS
 ```
 
 Raw bytes are queued before normalization. A parse failure therefore does not erase the
 offending frame. Storage failure is fatal and observable; it is not converted into silent
 data loss.
+
+Each normalized consumer has its own bounded FIFO queue and sequential worker. A full queue
+applies producer backpressure. A failed consumer is recorded and surfaced as a fatal pipeline
+error during publish or shutdown; it cannot silently disappear while collection continues.
+
+Replay selects raw rows by time, venue, symbol, and channel, then merges them with an explicit
+stable tie-break rule. `ReplayClock` and `DecisionScheduler` advance from event time without
+depending on asyncio task ordering. Live and replay both publish into `NormalizedEventBus`.
 
 ## Connector lifecycle
 
