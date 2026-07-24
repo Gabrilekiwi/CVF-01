@@ -90,6 +90,11 @@ features:
   atr_period_seconds: 60
   zscore_lookback_seconds: 1800
   spread_percentile_lookback_seconds: 86400
+  state_retention_seconds: 86400
+  maximum_events_per_stream: 500000
+  late_event_policy: "drop"
+  maximum_lateness_ms: 250
+  book_pending_updates: 10000
 
 scoring:
   exchange_factor_weights:

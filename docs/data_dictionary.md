@@ -121,17 +121,28 @@ activity samples and not complete liquidation totals.
 
 Exchange-wide health uses `symbol="*"`.
 
-### `MarketFeature`
+### `FeatureSnapshot` schema v1
+
+The legacy `MarketFeature.values` map remains a compatibility model. Phase 3 uses the typed,
+versioned `FeatureSnapshot` contract:
 
 | Field | Meaning |
 |---|---|
-| `feature_snapshot_id` | UUID joining signals back to exact features |
-| `window_seconds` | Trailing window represented |
-| `values` | Named finite numeric values/nulls |
-| `is_warm` | Whether all required lookback data exists |
-| `source_event_count` | Valid source events used |
+| `feature_snapshot_id` | UUID joining later signals to exact features |
+| `schema_version`, `strategy_version` | Immutable schema and strategy identities |
+| `calculation_timestamp`, `decision_timestamp` | Calculation time and no-lookahead boundary |
+| `window_seconds` | Trailing `(decision-window, decision]` interval |
+| `book_generation`, `source_sequence_id` | Exact order-book lifecycle/source boundary |
+| `source_event_count` | Valid accepted source events used |
+| `oldest_source_timestamp`, `newest_source_timestamp` | Auditable event-time bounds |
+| `data_age_ms` | Age of the newest required source at decision time |
+| `is_warm`, `is_healthy` | Separate statistical warmup and operational health gates |
+| `unavailable_reasons` | Structured missing, stale, generation, health, or backlog blockers |
+| typed feature groups | Trade flow, order book, price, OI, crowding, and liquidation |
 
-Null means unavailable/undefined; it is distinct from zero.
+Null means unavailable/undefined and is distinct from true numeric zero. A non-warm or unhealthy
+snapshot must contain at least one structured reason. A source timestamp after the decision
+boundary is rejected.
 
 ## 5. Signal model
 

@@ -13,6 +13,8 @@ from uuid import uuid4
 
 import pytest
 
+from cvf.config import load_settings
+from cvf.features import FeatureStatePipeline, MarketStateStore
 from cvf.models import Exchange, Trade
 from cvf.pipeline import NormalizedEventBus
 from cvf.replay import RawParquetReader, ReplayOrder, ReplayRunner
@@ -77,11 +79,15 @@ async def test_reader_replays_live_normalization_equivalently() -> None:
 
         replayed: list[Trade] = []
         bus = NormalizedEventBus(default_queue_capacity=2)
+        feature_state = FeatureStatePipeline(
+            MarketStateStore(load_settings(environ={}).features)
+        )
 
         async def capture(event: Trade) -> None:
             replayed.append(event)
 
         bus.register("capture", capture)  # type: ignore[arg-type]
+        bus.register("feature-state", feature_state.consume)
         reader = RawParquetReader(raw)
         runner = ReplayRunner(
             event_bus=bus,
@@ -96,6 +102,9 @@ async def test_reader_replays_live_normalization_equivalently() -> None:
         assert summary.raw_records == 2
         assert summary.normalized_events == 2
         assert summary.connection_generations["BINANCE:aggTrade:BTC-USDT-PERP"] == 3
+        state = feature_state.store.state(Exchange.BINANCE, "BTC-USDT-PERP")
+        assert [item.value.trade_id for item in state.trades] == ["1", "2"]
+        assert feature_state.stats.accepted_events == 2
 
 
 @pytest.mark.asyncio
