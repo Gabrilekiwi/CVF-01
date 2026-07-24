@@ -144,6 +144,21 @@ Null means unavailable/undefined and is distinct from true numeric zero. A non-w
 snapshot must contain at least one structured reason. A source timestamp after the decision
 boundary is rejected.
 
+Single-venue typed groups include:
+
+| Group | Values |
+|---|---|
+| trade flow | buy/sell notional, taker imbalance/Z-score, notional/count impulse, average size, large-trade share |
+| order book | weighted depth, bid/ask change, additions/removals, recovery quantity per second, imbalance, spread, mid, microprice, depth-walk slippage, OFI/Z-score |
+| price | return/impulse Z-score, realized volatility, 1-second-bucket ATR, trailing high/low, ATR-relative move, abnormal-jump flag |
+| open interest | absolute/percentage change, venue-local Z-score, age, `PriceOpenInterestState` |
+| crowding | funding/Z-score, mark-index premium/Z-score, taker bias, `CrowdingState` |
+| liquidation | public-sample long/short notional, activity Z-score, activity-with-OI-decline flag |
+
+`removed_liquidity_quantity` is a depth-update removal proxy, not proof that the quantity was
+cancelled rather than executed. Liquidation fields intentionally use `public_sample` naming
+because neither venue feed represents total market liquidations.
+
 ## 5. Signal model
 
 `TradingSignal` adds:

@@ -2,9 +2,9 @@
 
 ## Scope
 
-CVF-01 remains a modular monolith and paper-trading research system. Phase 3A activates
-bounded feature state after the event bus for both live collection and replay. It contains no
-credentials, private APIs, calculated strategy factors, signals, or order execution.
+CVF-01 remains a modular monolith and paper-trading research system. Phase 3B calculates typed,
+single-venue observations over the bounded feature state shared by live collection and replay.
+It contains no credentials, private APIs, market scores, signals, or order execution.
 
 | Area | Phase-2 status |
 |---|---|
@@ -18,7 +18,8 @@ credentials, private APIs, calculated strategy factors, signals, or order execut
 | Ordered event bus and deterministic clock/scheduler | Implemented |
 | Raw scan, normalized replay, compaction audit, CI | Implemented |
 | Bounded venue/symbol state and feature availability | Implemented |
-| Feature calculations/persistence, signals, trading, backtests, UI | Not active |
+| Deterministic single-venue feature calculations | Implemented |
+| Cross-venue features/persistence, signals, trading, backtests, UI | Not active |
 
 ## Implemented data flow
 
@@ -44,7 +45,8 @@ flowchart LR
     BN --> BUS["Bounded normalized event bus"]
     ON --> BUS
     BUS --> STATE["Bounded feature state"]
-    STATE --> NEXT["Phase-3B calculations"]
+    STATE --> VF["Single-venue features"]
+    VF --> NEXT["Phase-3C alignment"]
     PQ --> RR["Stable raw reader"]
     RR --> RN["Live normalizers"]
     RN --> BUS
@@ -71,6 +73,12 @@ The feature-side book applies absolute normalized levels. Updates arriving befor
 bounded and replayed after that snapshot. Any generation change immediately invalidates the old
 book window and restarts warmup. Sequence gaps, crossed books, missing OI, stale OI, blocked
 stream health, and pipeline backlog remain structured unavailability rather than numeric zeros.
+
+`SingleVenueFeatureEngine` closes every trailing window at an explicit decision timestamp. It
+calculates trade flow, sequence-valid book/OFI observations, price and volatility, OI context,
+funding/premium crowding, and public-sample liquidation activity. Feature UUIDs are derived from
+strategy, venue, symbol, window, decision time, and book source boundary. A current book that
+already includes a post-decision update is rejected instead of being silently rewound.
 
 ## Connector lifecycle
 

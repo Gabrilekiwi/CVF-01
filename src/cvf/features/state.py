@@ -67,6 +67,17 @@ class FeatureBookView:
     last_error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class BookChange:
+    bid_quantity_delta: Decimal
+    ask_quantity_delta: Decimal
+    added_bid_quantity: Decimal
+    added_ask_quantity: Decimal
+    removed_bid_quantity: Decimal
+    removed_ask_quantity: Decimal
+    order_flow_imbalance: Decimal
+
+
 def _sequence(value: int | str | None) -> int | None:
     if value is None:
         return None
@@ -90,6 +101,7 @@ class FeatureOrderBookState:
         self.sequence_id: int | None = None
         self.synchronized = False
         self.last_error: str | None = None
+        self.last_change: BookChange | None = None
 
     def _reset(self, generation: int, reason: str | None = None) -> None:
         self._bids.clear()
@@ -99,6 +111,7 @@ class FeatureOrderBookState:
         self.sequence_id = None
         self.synchronized = False
         self.last_error = reason
+        self.last_change = None
 
     @staticmethod
     def _apply_side(
@@ -127,6 +140,39 @@ class FeatureOrderBookState:
             self.last_error = "order book became crossed or locked"
             return False
         return True
+
+    def _measure_change(self, update: OrderBookUpdate) -> BookChange:
+        bid_deltas = [
+            level.quantity - self._bids.get(level.price, Decimal(0))
+            for level in update.bids
+        ]
+        ask_deltas = [
+            level.quantity - self._asks.get(level.price, Decimal(0))
+            for level in update.asks
+        ]
+        bid_delta = sum(bid_deltas, Decimal(0))
+        ask_delta = sum(ask_deltas, Decimal(0))
+        return BookChange(
+            bid_quantity_delta=bid_delta,
+            ask_quantity_delta=ask_delta,
+            added_bid_quantity=sum(
+                (delta for delta in bid_deltas if delta > 0),
+                Decimal(0),
+            ),
+            added_ask_quantity=sum(
+                (delta for delta in ask_deltas if delta > 0),
+                Decimal(0),
+            ),
+            removed_bid_quantity=sum(
+                (-delta for delta in bid_deltas if delta < 0),
+                Decimal(0),
+            ),
+            removed_ask_quantity=sum(
+                (-delta for delta in ask_deltas if delta < 0),
+                Decimal(0),
+            ),
+            order_flow_imbalance=bid_delta - ask_delta,
+        )
 
     def _buffer(self, update: OrderBookUpdate) -> StateUpdateStatus:
         if len(self._pending) >= self._pending_capacity:
@@ -165,8 +211,10 @@ class FeatureOrderBookState:
                     self.synchronized = False
                     self.last_error = "pending update has a sequence gap"
                     return StateUpdateStatus.BOOK_INVALIDATED
+            change = self._measure_change(update)
             if not self._apply_levels(update.bids, update.asks):
                 return StateUpdateStatus.BOOK_INVALIDATED
+            self.last_change = change
             self.sequence_id = sequence or self.sequence_id
         return (
             StateUpdateStatus.ACCEPTED
@@ -192,8 +240,10 @@ class FeatureOrderBookState:
                 self.last_error = "order-book update sequence gap"
                 self._pending.clear()
                 return self._buffer(update)
+        change = self._measure_change(update)
         if not self._apply_levels(update.bids, update.asks):
             return StateUpdateStatus.BOOK_INVALIDATED
+        self.last_change = change
         self.sequence_id = sequence or self.sequence_id
         return StateUpdateStatus.ACCEPTED
 
@@ -231,6 +281,7 @@ class VenueSymbolState:
     index_prices: BoundedTimeWindow[IndexPrice]
     liquidations: BoundedTimeWindow[LiquidationEvent]
     book_updates: BoundedTimeWindow[OrderBookSnapshot | OrderBookUpdate]
+    book_changes: BoundedTimeWindow[BookChange]
     order_book: FeatureOrderBookState
     latest_by_type: dict[EventType, StatefulMarketEvent] = field(default_factory=dict)
     health_by_channel: dict[str, HealthStatus] = field(default_factory=dict)
@@ -249,6 +300,7 @@ class VenueSymbolState:
                 self.index_prices,
                 self.liquidations,
                 self.book_updates,
+                self.book_changes,
             )
         )
 
@@ -283,6 +335,7 @@ class MarketStateStore:
             index_prices=self._window(),  # type: ignore[arg-type]
             liquidations=self._window(),  # type: ignore[arg-type]
             book_updates=self._window(),  # type: ignore[arg-type]
+            book_changes=self._window(),  # type: ignore[arg-type]
             order_book=FeatureOrderBookState(
                 pending_capacity=self._config.book_pending_updates
             ),
@@ -319,6 +372,7 @@ class MarketStateStore:
             status = state.order_book.apply_snapshot(event)
             if event.generation != previous_generation:
                 state.book_updates.clear()
+                state.book_changes.clear()
             if status is StateUpdateStatus.ACCEPTED:
                 state.book_updates.clear()
                 window_status = state.book_updates.append(event_at, event)
@@ -328,8 +382,12 @@ class MarketStateStore:
             status = state.order_book.apply_update(event)
             if event.generation != previous_generation:
                 state.book_updates.clear()
+                state.book_changes.clear()
             if status is StateUpdateStatus.ACCEPTED:
                 status = self._window_status(state.book_updates.append(event_at, event))
+                change = state.order_book.last_change
+                if change is not None and status is StateUpdateStatus.ACCEPTED:
+                    status = self._window_status(state.book_changes.append(event_at, change))
         elif isinstance(event, Trade):
             status = self._window_status(state.trades.append(event_at, event))
             if status is StateUpdateStatus.ACCEPTED:
