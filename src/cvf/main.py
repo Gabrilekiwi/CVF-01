@@ -178,6 +178,7 @@ async def run_collection(
             "health_status_counts": summary.health_status_counts,
             "parquet": summary.parquet,
             "pipeline": summary.pipeline,
+            "feature_state": summary.feature_state,
         },
     )
     return 0
@@ -204,10 +205,17 @@ async def run_replay(
 ) -> int:
     """Replay retained raw records without exchange connectivity."""
 
+    from cvf.features import FeatureStatePipeline, MarketStateStore
     from cvf.pipeline import NormalizedEventBus
 
     bus = NormalizedEventBus(
         default_queue_capacity=settings.pipeline.consumer_queue_capacity
+    )
+    feature_state = FeatureStatePipeline(MarketStateStore(settings.features))
+    bus.register(
+        "feature-state",
+        feature_state.consume,
+        queue_capacity=settings.pipeline.consumer_queue_capacity,
     )
     reader = RawParquetReader(input_path)
     filters = RawScanFilter(
@@ -231,6 +239,7 @@ async def run_replay(
             "event": "replay_complete",
             "input_path": str(input_path.resolve()),
             **asdict(summary),
+            "feature_state": asdict(feature_state.stats),
         },
     )
     return 0

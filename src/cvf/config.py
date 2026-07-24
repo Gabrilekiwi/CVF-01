@@ -118,6 +118,11 @@ class FeaturesConfig(FrozenConfigModel):
     atr_period_seconds: int = Field(gt=0)
     zscore_lookback_seconds: int = Field(gt=0)
     spread_percentile_lookback_seconds: int = Field(gt=0)
+    state_retention_seconds: int = Field(default=86_400, gt=0)
+    maximum_events_per_stream: int = Field(default=500_000, gt=0)
+    late_event_policy: Literal["drop", "insert"] = "drop"
+    maximum_lateness_ms: int = Field(default=250, ge=0)
+    book_pending_updates: int = Field(default=10_000, gt=0)
 
     @model_validator(mode="after")
     def validate_depth_weights(self) -> FeaturesConfig:
@@ -125,6 +130,18 @@ class FeaturesConfig(FrozenConfigModel):
             raise ValueError("order_book_level_weights must match order_book_depth")
         if any(weight <= 0 for weight in self.order_book_level_weights):
             raise ValueError("order-book weights must be positive")
+        required_retention = max(
+            self.breakout_lookback_seconds,
+            self.atr_period_seconds,
+            self.zscore_lookback_seconds,
+            self.spread_percentile_lookback_seconds,
+            *self.trade_imbalance_windows_seconds,
+            *self.price_impulse_windows_seconds,
+            *self.open_interest_windows_seconds,
+            *self.liquidation_windows_seconds,
+        )
+        if self.state_retention_seconds < required_retention:
+            raise ValueError("state_retention_seconds must cover every configured feature window")
         return self
 
 

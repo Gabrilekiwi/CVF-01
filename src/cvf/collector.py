@@ -13,6 +13,7 @@ from typing import Any
 from cvf.config import Settings
 from cvf.exchanges.binance import BinanceMarketDataConnector
 from cvf.exchanges.okx import OKXMarketDataConnector
+from cvf.features import FeatureStatePipeline, FeatureStatePipelineStats, MarketStateStore
 from cvf.monitoring import StreamHealthRegistry, StreamHealthSnapshot, StreamKey
 from cvf.normalization.common import NormalizedMarketEvent
 from cvf.pipeline import ConsumerStats, NormalizedEventBus
@@ -32,6 +33,7 @@ class CollectionSummary:
     health_status_counts: dict[str, int]
     parquet: ParquetWriterStats
     pipeline: dict[str, ConsumerStats]
+    feature_state: FeatureStatePipelineStats
 
     @property
     def duration_seconds(self) -> float:
@@ -61,6 +63,12 @@ class MarketDataCollector:
         self._event_counts: Counter[str] = Counter()
         self._event_bus = event_bus or NormalizedEventBus(
             default_queue_capacity=settings.pipeline.consumer_queue_capacity
+        )
+        self._feature_state = FeatureStatePipeline(MarketStateStore(settings.features))
+        self._event_bus.register(
+            "feature-state",
+            self._feature_state.consume,
+            queue_capacity=settings.pipeline.consumer_queue_capacity,
         )
         self._writer = AsyncPartitionedParquetWriter(
             root_path=self.output_path,
@@ -123,6 +131,8 @@ class MarketDataCollector:
     async def _status_loop(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             snapshots = self.health_snapshots()
+            for snapshot in snapshots:
+                self._feature_state.store.update_stream_health(snapshot)
             self._logger.info(
                 "market-data collection status",
                 extra={
@@ -236,4 +246,5 @@ class MarketDataCollector:
             health_status_counts=dict(statuses),
             parquet=self._writer.stats,
             pipeline=self._event_bus.stats,
+            feature_state=self._feature_state.stats,
         )

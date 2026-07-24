@@ -1,8 +1,9 @@
 # Cross-Venue Short-Term Flow Strategy (CVF-01)
 
 CVF-01 is a research-first, paper-trading-only system for short-horizon Binance and OKX
-USDT perpetual signals. Phase 2.5 adds the deterministic processing, replay, compaction, and
-CI boundaries needed by the feature engine. It still does not generate signals or place orders.
+USDT perpetual signals. Phase 3A adds the bounded state and window foundation used by both
+live processing and replay. It still does not calculate strategy factors, generate signals,
+or place orders.
 
 ## Current status
 
@@ -31,8 +32,20 @@ Phase 2.5 additionally includes:
 - read-only-source raw compaction with UUID, content hash, payload, and partition audit;
 - an offline replay/compaction CLI and a GitHub Actions quality/wheel gate.
 
-Phase 3 features, scoring, signals, paper trading, private APIs, and real orders remain
-unimplemented.
+Phase 3A additionally includes:
+
+- isolated per-exchange/per-symbol trade, price, OI, funding, mark/index, liquidation, and
+  order-book state;
+- event-time windows with explicit `(start, end]` boundaries, hard item limits, and configured
+  late-event behavior;
+- snapshot/update book reconstruction for feature state, bounded pre-snapshot buffering, and
+  generation-specific warmup reset;
+- structured warmup, missing-data, stale-OI, stream-health, and pipeline-backlog blockers;
+- a versioned typed `FeatureSnapshot` schema that cannot hide missing values as zero;
+- the same feature-state consumer registered in live collection and offline replay.
+
+Phase 3B–D calculations and persistence, scoring, signals, paper trading, private APIs, and
+real orders remain unimplemented.
 
 ## Safety boundary
 
@@ -176,7 +189,8 @@ src/cvf/
   clock/                 live/replay clock and deterministic scheduler
   replay/                raw scanning, ordering, normalization, replay runner
   models/                immutable normalized records
-  features/, strategy/   Phase-3+ boundaries; not active
+  features/              bounded Phase-3 state, availability, typed snapshot contracts
+  strategy/              Phase-4+ boundary; not active
 tests/                   unit/integration tests and versioned payload fixtures
 data/raw/                ignored runtime collection output
 ```
@@ -200,8 +214,10 @@ and [OKX API v5 documentation](https://www.okx.com/docs-v5/en/). See
    Parquet, recovery, and soak validation.
 2. **Phase 2.5 (implemented):** event bus, deterministic clock/scheduler, raw replay,
    compaction audit, and CI.
-3. **Phase 3:** per-venue and cross-venue features.
-4. **Phase 4:** scores and entry/exit/hold/no-trade signals.
-5. **Phase 5:** order-book-based paper fills and risk controls.
-6. **Phase 6:** backtests, evaluation, and parameter sensitivity.
-7. **Phase 7:** a small monitoring dashboard.
+3. **Phase 3A (implemented):** bounded venue/symbol state, late-event rules, book-generation
+   reset, feature availability, and typed snapshot schema.
+4. **Phase 3B–D:** per-venue and cross-venue features plus feature persistence.
+5. **Phase 4:** scores and entry/exit/hold/no-trade signals.
+6. **Phase 5:** order-book-based paper fills and risk controls.
+7. **Phase 6:** backtests, evaluation, and parameter sensitivity.
+8. **Phase 7:** a small monitoring dashboard.

@@ -1,0 +1,149 @@
+"""Strictly bounded event-time windows with explicit late-event behavior."""
+
+from __future__ import annotations
+
+from bisect import bisect_right
+from collections import deque
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+
+
+class LateEventPolicy(StrEnum):
+    DROP = "drop"
+    INSERT = "insert"
+
+
+class AppendStatus(StrEnum):
+    ACCEPTED = "ACCEPTED"
+    LATE_DROPPED = "LATE_DROPPED"
+    EXPIRED_DROPPED = "EXPIRED_DROPPED"
+
+
+@dataclass(frozen=True, slots=True)
+class TimedValue[T]:
+    timestamp: datetime
+    value: T
+    ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class WindowStats:
+    size: int
+    accepted: int
+    late_dropped: int
+    expired_dropped: int
+    capacity_evictions: int
+    watermark: datetime | None
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("window timestamps must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+class BoundedTimeWindow[T]:
+    """Keep ``(watermark-retention, watermark]`` with a hard item cap."""
+
+    def __init__(
+        self,
+        *,
+        retention: timedelta,
+        maximum_items: int,
+        late_event_policy: LateEventPolicy = LateEventPolicy.DROP,
+        maximum_lateness: timedelta = timedelta(0),
+    ) -> None:
+        if retention <= timedelta(0):
+            raise ValueError("retention must be positive")
+        if maximum_items < 1:
+            raise ValueError("maximum_items must be positive")
+        if maximum_lateness < timedelta(0):
+            raise ValueError("maximum_lateness cannot be negative")
+        self.retention = retention
+        self.maximum_items = maximum_items
+        self.late_event_policy = late_event_policy
+        self.maximum_lateness = maximum_lateness
+        self._items: deque[TimedValue[T]] = deque()
+        self._watermark: datetime | None = None
+        self._ordinal = 0
+        self._accepted = 0
+        self._late_dropped = 0
+        self._expired_dropped = 0
+        self._capacity_evictions = 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[TimedValue[T]]:
+        return iter(self._items)
+
+    @property
+    def stats(self) -> WindowStats:
+        return WindowStats(
+            size=len(self),
+            accepted=self._accepted,
+            late_dropped=self._late_dropped,
+            expired_dropped=self._expired_dropped,
+            capacity_evictions=self._capacity_evictions,
+            watermark=self._watermark,
+        )
+
+    def _prune(self) -> None:
+        if self._watermark is None:
+            return
+        cutoff = self._watermark - self.retention
+        while self._items and self._items[0].timestamp <= cutoff:
+            self._items.popleft()
+        while len(self._items) > self.maximum_items:
+            self._items.popleft()
+            self._capacity_evictions += 1
+
+    def append(self, timestamp: datetime, value: T) -> AppendStatus:
+        event_at = _utc(timestamp)
+        watermark = self._watermark
+        if watermark is not None and event_at < watermark:
+            if event_at <= watermark - self.retention:
+                self._expired_dropped += 1
+                return AppendStatus.EXPIRED_DROPPED
+            if (
+                self.late_event_policy is LateEventPolicy.DROP
+                or watermark - event_at > self.maximum_lateness
+            ):
+                self._late_dropped += 1
+                return AppendStatus.LATE_DROPPED
+        self._ordinal += 1
+        item = TimedValue(event_at, value, self._ordinal)
+        if watermark is None or event_at >= watermark:
+            self._items.append(item)
+            self._watermark = event_at
+        else:
+            items = list(self._items)
+            keys = [(entry.timestamp, entry.ordinal) for entry in items]
+            items.insert(bisect_right(keys, (event_at, self._ordinal)), item)
+            self._items = deque(items)
+        self._accepted += 1
+        self._prune()
+        return AppendStatus.ACCEPTED
+
+    def values_between(self, start_exclusive: datetime, end_inclusive: datetime) -> list[T]:
+        """Return the explicit trailing interval ``(start, end]``."""
+
+        start = _utc(start_exclusive)
+        end = _utc(end_inclusive)
+        if end < start:
+            raise ValueError("window end cannot precede start")
+        result: list[T] = []
+        for item in reversed(self._items):
+            if item.timestamp > end:
+                continue
+            if item.timestamp <= start:
+                break
+            result.append(item.value)
+        result.reverse()
+        return result
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._watermark = None

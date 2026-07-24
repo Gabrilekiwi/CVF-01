@@ -2,9 +2,9 @@
 
 ## Scope
 
-CVF-01 remains a modular monolith and paper-trading research system. Phase 2.5 activates the
-bounded processing and offline replay boundaries after public acquisition. It contains no
-credentials, private APIs, calculated features, signals, or order execution.
+CVF-01 remains a modular monolith and paper-trading research system. Phase 3A activates
+bounded feature state after the event bus for both live collection and replay. It contains no
+credentials, private APIs, calculated strategy factors, signals, or order execution.
 
 | Area | Phase-2 status |
 |---|---|
@@ -17,7 +17,8 @@ credentials, private APIs, calculated features, signals, or order execution.
 | Bounded raw Parquet storage | Implemented |
 | Ordered event bus and deterministic clock/scheduler | Implemented |
 | Raw scan, normalized replay, compaction audit, CI | Implemented |
-| Features, signals, trading, backtests, UI | Not active |
+| Bounded venue/symbol state and feature availability | Implemented |
+| Feature calculations/persistence, signals, trading, backtests, UI | Not active |
 
 ## Implemented data flow
 
@@ -42,7 +43,8 @@ flowchart LR
     OB --> H
     BN --> BUS["Bounded normalized event bus"]
     ON --> BUS
-    BUS --> NEXT["Phase-3 feature boundary"]
+    BUS --> STATE["Bounded feature state"]
+    STATE --> NEXT["Phase-3B calculations"]
     PQ --> RR["Stable raw reader"]
     RR --> RN["Live normalizers"]
     RN --> BUS
@@ -59,6 +61,16 @@ error during publish or shutdown; it cannot silently disappear while collection 
 Replay selects raw rows by time, venue, symbol, and channel, then merges them with an explicit
 stable tie-break rule. `ReplayClock` and `DecisionScheduler` advance from event time without
 depending on asyncio task ordering. Live and replay both publish into `NormalizedEventBus`.
+
+Feature state is keyed by `(exchange, canonical symbol)`. Each channel family has an independent
+event-time window with a configured duration and hard item cap. Default late events are dropped;
+an insertion policy can admit events within a configured lateness bound. Window queries use
+`(start, end]`, so decision-boundary behavior is deterministic.
+
+The feature-side book applies absolute normalized levels. Updates arriving before a snapshot are
+bounded and replayed after that snapshot. Any generation change immediately invalidates the old
+book window and restarts warmup. Sequence gaps, crossed books, missing OI, stale OI, blocked
+stream health, and pipeline backlog remain structured unavailability rather than numeric zeros.
 
 ## Connector lifecycle
 
