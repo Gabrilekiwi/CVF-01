@@ -1,9 +1,9 @@
 # Cross-Venue Short-Term Flow Strategy (CVF-01)
 
 CVF-01 is a research-first, paper-trading-only system for short-horizon Binance and OKX
-USDT perpetual signals. Phase 3B adds deterministic single-venue feature calculations over the
-bounded state shared by live processing and replay. It still does not score markets, generate
-signals, or place orders.
+USDT perpetual signals. Phase 3C adds deterministic cross-venue alignment and research features
+over the single-venue snapshots shared by live processing and replay. It still does not score
+markets, generate signals, or place orders.
 
 ## Current status
 
@@ -56,8 +56,20 @@ Phase 3B additionally includes:
 - deterministic feature IDs, strict decision-time source bounds, and explicit rejection of a
   book containing post-decision updates.
 
-Phase 3C–D cross-venue calculations and persistence, scoring, signals, paper trading, private
-APIs, and real orders remain unimplemented.
+Phase 3C additionally includes:
+
+- deterministic Binance/OKX snapshot selection at or before an explicit decision boundary;
+- configurable source-age and inter-venue timestamp thresholds with typed alignment states;
+- symmetric mid-price spread, spread percentage/Z-score, direction, impulse, volatility, and
+  relative-spread comparisons;
+- typed taker-flow, OFI, depth, liquidity, OI-context, funding, crowding, and public-liquidation
+  confirmations or divergences;
+- config/code/source lineage and deterministic cross-venue snapshot IDs;
+- explicitly research-only confirmation and lead/lag fields; lead/lag remains unavailable until
+  independently validated event-time history exists and never uses local arrival order.
+
+Phase 3D feature persistence, scoring, signals, paper trading, private APIs, and real orders
+remain unimplemented.
 
 ## Safety boundary
 
@@ -210,6 +222,7 @@ data/raw/                ignored runtime collection output
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Cross-venue feature contract](docs/cross_venue_features.md)
 - [Data dictionary](docs/data_dictionary.md)
 - [Operations](docs/operations.md)
 - [Strategy specification](docs/strategy.md)
@@ -230,8 +243,10 @@ and [OKX API v5 documentation](https://www.okx.com/docs-v5/en/). See
    reset, feature availability, and typed snapshot schema.
 4. **Phase 3B (implemented):** deterministic single-venue trade, book, price, OI, crowding,
    and public-sample liquidation features.
-5. **Phase 3C–D:** cross-venue features plus feature persistence.
-6. **Phase 4:** scores and entry/exit/hold/no-trade signals.
-7. **Phase 5:** order-book-based paper fills and risk controls.
-8. **Phase 6:** backtests, evaluation, and parameter sensitivity.
-9. **Phase 7:** a small monitoring dashboard.
+5. **Phase 3C (implemented):** deterministic cross-venue alignment, comparisons,
+   confirmation/divergence observations, and research-only lead/lag schema.
+6. **Phase 3D:** versioned feature persistence and live/replay artifact consistency.
+7. **Phase 4:** scores and entry/exit/hold/no-trade signals.
+8. **Phase 5:** order-book-based paper fills and risk controls.
+9. **Phase 6:** backtests, evaluation, and parameter sensitivity.
+10. **Phase 7:** a small monitoring dashboard.

@@ -159,6 +159,31 @@ Single-venue typed groups include:
 cancelled rather than executed. Liquidation fields intentionally use `public_sample` naming
 because neither venue feed represents total market liquidations.
 
+### `CrossVenueFeatureSnapshot` schema v1
+
+The Phase 3C cross-venue record has `exchange=CROSS_VENUE` and preserves:
+
+| Group | Values |
+|---|---|
+| lineage | strategy/code versions, config hash, deterministic ID, both source snapshot IDs, book generations, event count, and source time bounds |
+| alignment | both source IDs/timestamps/ages, absolute data-age difference, source timestamp difference, typed status, quality, and structured reasons |
+| price | both mids, signed/absolute spread, explicit symmetric denominator, percentage spread/Z-score, return/impulse direction, impulse strength, volatility, and relative-spread differences |
+| order flow | taker and OFI direction/difference, taker strength, depth difference, liquidity additions/removals, recovery difference, and typed liquidity divergence |
+| positioning | percentage-OI directions and price/OI context, funding direction/abnormality, premium difference, crowding agreement, and public-sample liquidation confirmation |
+| confirmation | typed price/impulse/taker/OFI/crowding/liquidation observations, a bounded research-only aggregate, and divergence input |
+| lead/lag | research-only typed fields plus explicit unavailable reasons; local arrival order is prohibited |
+
+The percentage mid spread is:
+
+```text
+(binance_mid - okx_mid) / ((abs(binance_mid) + abs(okx_mid)) / 2)
+```
+
+The denominator is stored explicitly. A zero denominator, missing side, or insufficient prior
+paired history produces null plus a structured reason; it never becomes numeric zero.
+Cross-venue OI uses percentage change and venue-local `PriceOpenInterestState` only. Absolute OI
+is not compared because venue contract units are not interchangeable.
+
 ## 5. Signal model
 
 `TradingSignal` adds:
