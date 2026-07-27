@@ -12,7 +12,8 @@ from cvf.config import load_settings
 def test_default_configuration_loads_and_is_paper_only() -> None:
     settings = load_settings(environ={})
 
-    assert __version__ == "0.2.1"
+    assert __version__ == "0.3.0"
+    assert settings.app.strategy_version == "0.3.0"
     assert settings.app.paper_trading_only is True
     assert settings.markets.canonical_symbols == [
         "BTC-USDT-PERP",

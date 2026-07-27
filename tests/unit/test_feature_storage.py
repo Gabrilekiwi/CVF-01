@@ -95,7 +95,7 @@ def single(
         sequence_id=identifier,
         raw_payload_reference=f"raw://{UUID(int=identifier)}",
         feature_snapshot_id=UUID(int=identifier),
-        strategy_version="0.1.0",
+        strategy_version="0.3.0",
         calculation_timestamp=at,
         decision_timestamp=at,
         window_seconds=window_seconds,
@@ -599,7 +599,7 @@ async def test_audit_reports_lineage_scope_and_time_bounds() -> None:
         assert audit.rows == audit.unique_snapshot_ids == 3
         assert audit.partitions == 3
         assert audit.scopes == ("BINANCE", "CROSS_VENUE", "OKX")
-        assert audit.code_versions == ("0.2.1",)
+        assert audit.code_versions == ("0.3.0",)
         assert audit.config_hashes
         assert audit.unavailable_snapshots == 1
         assert audit.unavailable_reason_counts == {
