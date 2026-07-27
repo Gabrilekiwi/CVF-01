@@ -128,6 +128,16 @@ async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
             connection_generation=0,
             raw_payload=Path("tests/fixtures/okx/instrument_btc_live.json").read_bytes(),
         )
+        eth_metadata = RawMarketRecord(
+            exchange=Exchange.OKX,
+            symbol="ETH-USDT-PERP",
+            channel="instrument_metadata",
+            message_kind="market_data",
+            transport="rest",
+            local_receive_timestamp=NOW + timedelta(milliseconds=1),
+            connection_generation=0,
+            raw_payload=Path("tests/fixtures/okx/instrument_eth_live.json").read_bytes(),
+        )
         trade_record = RawMarketRecord(
             exchange=Exchange.OKX,
             symbol="BTC-USDT-PERP",
@@ -142,6 +152,7 @@ async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
         await writer.start()
         await writer.write(trade_record)
         await writer.write(metadata)
+        await writer.write(eth_metadata)
         await writer.close()
 
         replayed: list[Trade] = []
@@ -158,8 +169,8 @@ async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
         assert len(replayed) == 1
         assert replayed[0].contract_quantity is not None
         assert replayed[0].quantity == replayed[0].contract_quantity * Decimal("0.01")
-        assert summary.raw_records == 2
-        assert summary.skipped_records == 1
+        assert summary.raw_records == 3
+        assert summary.skipped_records == 2
 
 
 @pytest.mark.asyncio
