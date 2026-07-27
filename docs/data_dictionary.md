@@ -184,6 +184,37 @@ paired history produces null plus a structured reason; it never becomes numeric 
 Cross-venue OI uses percentage change and venue-local `PriceOpenInterestState` only. Absolute OI
 is not compared because venue contract units are not interchangeable.
 
+### Feature Parquet schema v1
+
+Physical layout:
+
+```text
+data/processed/
+  feature_schema=v1/
+    date=YYYY-MM-DD/
+      symbol=BTC-USDT-PERP/
+        scope=BINANCE|OKX|CROSS_VENUE/
+          part-....parquet
+```
+
+| Field family | Values |
+|---|---|
+| identity/partition | `feature_schema_version`, feature UUID, scope, symbol, window, decision/calculation timestamps |
+| runtime lineage | strategy version, code version, full config SHA-256 |
+| source lineage | source snapshot IDs, source sequence, event count, oldest/newest source times, raw reference, venue book generations |
+| availability | data age, warm/healthy flags, structured top-level reason codes |
+| content integrity | canonical typed `payload_json` and its `payload_sha256` |
+
+The canonical payload excludes computed display fields and can be validated directly back into
+`FeatureSnapshot` or `CrossVenueFeatureSnapshot`. Query columns must exactly match that payload.
+Any schema drift, hash mismatch, metadata mismatch, wrong partition, duplicate UUID, or
+non-monotonic file order fails the reader/audit.
+
+Tree comparison hashes logical records rather than filenames. Live and replay outputs may use
+different batch boundaries but must have identical IDs, canonical payloads, code/config lineage,
+partitions, scopes, and decision bounds. Float values are exact persisted inputs; no unstated
+tolerance is applied.
+
 ## 5. Signal model
 
 `TradingSignal` adds:

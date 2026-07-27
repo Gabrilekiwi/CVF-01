@@ -1,9 +1,9 @@
 # Cross-Venue Short-Term Flow Strategy (CVF-01)
 
 CVF-01 is a research-first, paper-trading-only system for short-horizon Binance and OKX
-USDT perpetual signals. Phase 3C adds deterministic cross-venue alignment and research features
-over the single-venue snapshots shared by live processing and replay. It still does not score
-markets, generate signals, or place orders.
+USDT perpetual signals. Phase 3D adds audited, versioned Parquet persistence for the deterministic
+single-venue and cross-venue snapshots shared by live processing and replay. It still does not
+score markets, generate signals, or place orders.
 
 ## Current status
 
@@ -68,8 +68,18 @@ Phase 3C additionally includes:
 - explicitly research-only confirmation and lead/lag fields; lead/lag remains unavailable until
   independently validated event-time history exists and never uses local arrival order.
 
-Phase 3D feature persistence, scoring, signals, paper trading, private APIs, and real orders
-remain unimplemented.
+Phase 3D additionally includes:
+
+- atomic Zstandard Parquet under
+  `feature_schema=v1/date=.../symbol=.../scope=...`;
+- bounded asynchronous writes, observable backpressure, and bounded snapshot-ID deduplication;
+- canonical typed payload JSON with SHA-256, code/config versions, source IDs, generations,
+  source bounds, health/warmup, and structured reason lineage;
+- strict deterministic readers with time/scope/symbol/window/health filters;
+- schema, payload, partition, duplicate-ID, content-digest, and live/replay tree audits;
+- `cvf audit-features` and `cvf compare-features` offline verification commands.
+
+Scoring, signals, paper trading, private APIs, and real orders remain unimplemented.
 
 ## Safety boundary
 
@@ -170,6 +180,18 @@ python -m cvf compact-raw `
 The input tree is never modified. The command fails unless row count, unique UUIDs, exact
 row-content digest, payload bytes, lineage, and partitions agree before and after.
 
+Audit a persisted feature tree or compare live/replay outputs:
+
+```powershell
+python -m cvf audit-features --input data/processed
+python -m cvf compare-features `
+  --left data/acceptance/live `
+  --right data/acceptance/replay
+```
+
+Comparison is exact at the canonical payload/hash layer and allows only physical Parquet batch
+and file-boundary differences.
+
 ## Configuration
 
 `config/default.yaml` is merged with an optional overlay and then `CVF__...` environment
@@ -208,7 +230,7 @@ src/cvf/
   normalization/         typed Binance/OKX parsing and unit conversion
   orderbook/             exact venue-specific local books
   monitoring/            per-stream health accounting
-  storage/               bounded asynchronous raw Parquet writer
+  storage/               bounded raw/feature Parquet writers and audits
   pipeline/              bounded ordered normalized-event fan-out
   clock/                 live/replay clock and deterministic scheduler
   replay/                raw scanning, ordering, normalization, replay runner
@@ -224,6 +246,7 @@ data/raw/                ignored runtime collection output
 - [Architecture](docs/architecture.md)
 - [Cross-venue feature contract](docs/cross_venue_features.md)
 - [Data dictionary](docs/data_dictionary.md)
+- [Feature persistence and audit](docs/feature_persistence.md)
 - [Operations](docs/operations.md)
 - [Strategy specification](docs/strategy.md)
 
@@ -245,7 +268,8 @@ and [OKX API v5 documentation](https://www.okx.com/docs-v5/en/). See
    and public-sample liquidation features.
 5. **Phase 3C (implemented):** deterministic cross-venue alignment, comparisons,
    confirmation/divergence observations, and research-only lead/lag schema.
-6. **Phase 3D:** versioned feature persistence and live/replay artifact consistency.
+6. **Phase 3D (implemented):** versioned feature Parquet, bounded atomic writer, strict reader,
+   lineage audit, and exact live/replay logical-tree comparison.
 7. **Phase 4:** scores and entry/exit/hold/no-trade signals.
 8. **Phase 5:** order-book-based paper fills and risk controls.
 9. **Phase 6:** backtests, evaluation, and parameter sensitivity.
