@@ -374,6 +374,12 @@ def _parser() -> argparse.ArgumentParser:
     phase3_acceptance.add_argument("--first-batch-rows", type=int, default=1_000)
     phase3_acceptance.add_argument("--second-batch-rows", type=int, default=777)
     phase3_acceptance.add_argument(
+        "--writer-flush-seconds",
+        type=float,
+        default=60,
+        help="Offline flush interval; logical content remains batch-boundary independent",
+    )
+    phase3_acceptance.add_argument(
         "--requested-stability-hours",
         type=float,
         default=6.0,
@@ -519,6 +525,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     output_path=args.output,
                     first_batch_rows=args.first_batch_rows,
                     second_batch_rows=args.second_batch_rows,
+                    writer_flush_seconds=args.writer_flush_seconds,
                     requested_stability_seconds=(
                         args.requested_stability_hours * 60 * 60
                     ),

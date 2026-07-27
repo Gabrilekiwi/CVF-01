@@ -104,6 +104,7 @@ async def test_phase3_acceptance_replays_twice_and_writes_evidence() -> None:
         assert report.first_run.cross_venue_snapshots == 6
         assert report.first_run.feature_audit.rows == 9
         assert report.first_run.feature_state.accepted_events == 2
+        assert report.first_run.writer_flush_seconds == 60
         assert not report.full_stability_duration_completed
         assert (output / "summary.json").is_file()
         assert (output / "summary.md").is_file()

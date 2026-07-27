@@ -48,7 +48,7 @@ from cvf.storage.features import (
     FeatureAudit,
     FeatureConsistencyReport,
     FeatureWriterStats,
-    compare_feature_trees,
+    compare_feature_audits,
 )
 from cvf.storage.raw import RawMarketRecord
 
@@ -99,6 +99,7 @@ class Phase3RunMetrics:
     signal_outputs: int
     order_outputs: int
     private_api_requests: int
+    writer_flush_seconds: float
     throughput_records_per_second: float
     throughput_event_time_multiplier: float | None
 
@@ -381,6 +382,7 @@ async def _run_once(
     input_path: Path,
     output_path: Path,
     batch_rows: int,
+    writer_flush_seconds: float,
 ) -> Phase3RunMetrics:
     if output_path.exists() and any(output_path.iterdir()):
         raise ValueError(f"acceptance output must be empty: {output_path}")
@@ -410,7 +412,7 @@ async def _run_once(
         root_path=output_path,
         settings=settings,
         batch_rows=batch_rows,
-        flush_seconds=settings.storage.feature_parquet_flush_seconds,
+        flush_seconds=writer_flush_seconds,
         queue_capacity=settings.storage.feature_parquet_queue_capacity,
         deduplication_capacity=settings.storage.feature_deduplication_capacity,
     )
@@ -500,6 +502,7 @@ async def _run_once(
         signal_outputs=0,
         order_outputs=0,
         private_api_requests=0,
+        writer_flush_seconds=writer_flush_seconds,
         throughput_records_per_second=throughput,
         throughput_event_time_multiplier=multiplier,
     )
@@ -597,6 +600,10 @@ def _render_markdown(report: Phase3AcceptanceReport) -> str:
             f"{first.writer.maximum_write_latency_ms or 0.0:.3f} | "
             f"{second.writer.maximum_write_latency_ms or 0.0:.3f} |"
         ),
+        (
+            f"| Offline writer flush seconds | {first.writer_flush_seconds:.3f} | "
+            f"{second.writer_flush_seconds:.3f} |"
+        ),
         "",
         "## Availability and safety",
         "",
@@ -653,12 +660,15 @@ async def run_phase3_acceptance(
     output_path: Path,
     first_batch_rows: int = 1_000,
     second_batch_rows: int = 777,
+    writer_flush_seconds: float = 60,
     requested_stability_seconds: float = 6 * 60 * 60,
 ) -> Phase3AcceptanceReport:
     """Audit input, replay twice, compare exact feature content, and write evidence."""
 
     if first_batch_rows < 1 or second_batch_rows < 1:
         raise ValueError("acceptance writer batch sizes must be positive")
+    if writer_flush_seconds <= 0:
+        raise ValueError("acceptance writer flush interval must be positive")
     if requested_stability_seconds <= 0:
         raise ValueError("requested stability duration must be positive")
     source = input_path.resolve()
@@ -678,6 +688,7 @@ async def run_phase3_acceptance(
         input_path=source,
         output_path=destination / "run-1",
         batch_rows=first_batch_rows,
+        writer_flush_seconds=writer_flush_seconds,
     )
     second = await _run_once(
         label="run-2",
@@ -685,11 +696,13 @@ async def run_phase3_acceptance(
         input_path=source,
         output_path=destination / "run-2",
         batch_rows=second_batch_rows,
+        writer_flush_seconds=writer_flush_seconds,
     )
-    consistency = await asyncio.to_thread(
-        compare_feature_trees,
+    consistency = compare_feature_audits(
         first.output_path,
         second.output_path,
+        left=first.feature_audit,
+        right=second.feature_audit,
     )
     snapshot_counts_match = (
         first.single_venue_snapshots == second.single_venue_snapshots

@@ -971,6 +971,18 @@ def compare_feature_trees(
 
     left = audit_feature_tree(left_path, filters=filters)
     right = audit_feature_tree(right_path, filters=filters)
+    return compare_feature_audits(left_path, right_path, left=left, right=right)
+
+
+def compare_feature_audits(
+    left_path: Path,
+    right_path: Path,
+    *,
+    left: FeatureAudit,
+    right: FeatureAudit,
+) -> FeatureConsistencyReport:
+    """Compare two already-validated audits without reading either tree again."""
+
     identical = (
         left.rows == right.rows
         and left.unique_snapshot_ids == right.unique_snapshot_ids
