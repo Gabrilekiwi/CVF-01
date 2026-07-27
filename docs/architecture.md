@@ -2,12 +2,12 @@
 
 ## Scope
 
-CVF-01 remains a modular monolith and paper-trading research system. Phase 3D persists the
+CVF-01 remains a modular monolith and paper-trading research system. Version 0.3.0 persists the
 deterministic single-venue and cross-venue observations shared by live collection and replay in
-an audited, versioned feature tree. It contains no credentials, private APIs, market scores,
-signals, or order execution.
+an audited, versioned feature tree, then verifies them with a resumable Phase 3 acceptance
+harness. It contains no credentials, private APIs, market scores, signals, or order execution.
 
-| Area | Phase-2 status |
+| Area | Status |
 |---|---|
 | Configuration, models, logging | Implemented and tested |
 | Binance/OKX public collection | Implemented |
@@ -22,6 +22,7 @@ signals, or order execution.
 | Deterministic single-venue feature calculations | Implemented |
 | Deterministic cross-venue alignment and research features | Implemented |
 | Versioned feature persistence and live/replay consistency audit | Implemented |
+| Fixed-data acceptance, checkpoints, and stability evidence | Implemented |
 | Signals, trading, backtests, UI | Not active |
 
 ## Implemented data flow
@@ -52,6 +53,7 @@ flowchart LR
     VF --> XV["Phase-3C cross-venue alignment"]
     XV --> FP["Phase-3D feature Parquet"]
     FP --> FA["Schema + lineage + consistency audit"]
+    FA --> AC["Phase-3 acceptance report"]
     PQ --> RR["Stable raw reader"]
     RR --> RN["Live normalizers"]
     RN --> BUS
@@ -120,6 +122,20 @@ IDs fail closed.
 scope, partition, ID, and time-bound summaries. `compare_feature_trees` requires all logical
 content to match while permitting different physical batch/file boundaries. There is no implicit
 floating tolerance: the canonical persisted values must agree exactly.
+
+`Phase3AcceptanceRunner` first audits the fixed raw input, then drives two separate
+`ReplayRunner`/feature/writer instances with different writer batch sizes. Each run records
+normalization counts, feature-state outcomes, decision boundaries, writer statistics, CPU,
+RSS, throughput, and latency. A source timestamp after its decision boundary aborts
+immediately. The two audited logical trees must match exactly even when their physical files
+differ.
+
+Per-run checkpoints are atomically published at replay-complete and audit-complete boundaries.
+They are reusable only when package source, all settings, input/output paths, ordering, batch
+size, and flush interval match; reuse still performs a fresh tree audit. The stability harness
+repeats the same fixed-data acceptance until a requested wall-time target and records actual
+observation time separately from the target. It explicitly does not equate repeated fixed data
+with continuous live-feed recovery evidence.
 
 ## Connector lifecycle
 

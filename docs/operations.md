@@ -16,7 +16,7 @@ Run the deterministic gate:
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe -m ruff check .
-.\.venv\Scripts\python.exe -m mypy src/cvf
+.\.venv\Scripts\python.exe -m mypy --strict src/cvf
 .\.venv\Scripts\python.exe -m pip check
 ```
 
@@ -161,6 +161,66 @@ scopes, and decision-time bounds must match. A mismatch exits `1`.
 
 Treat any schema, payload hash, metadata/payload, partition, duplicate-ID, or consistency error
 as a failed run. Do not manually edit or merge feature files.
+
+## Phase 3 fixed-data acceptance
+
+The retained 30-minute collection is a wall-clock capture, so its final acceptance uses local
+receive-time ordering. Exchange timestamps remain in every event and are still enforced by
+decision-time source bounds and the no-lookahead check.
+
+```powershell
+cvf accept-phase3 `
+  --input data\processed\phase3-acceptance\raw-compacted `
+  --output data\processed\phase3-acceptance\fixed-30m-v0.3.0 `
+  --order receive-time
+```
+
+The command audits the raw tree, executes two independent replays with writer batches of 1,000
+and 777 rows, audits both feature trees, compares their exact logical content, and writes
+machine-readable JSON plus a Markdown summary. It fails immediately on a source timestamp after
+its decision boundary. Use `--resume` only after interruption: checkpoints are accepted only
+when the input path, package-source hash, complete settings fingerprint, replay order, writer
+configuration, and output paths match, and completed trees are audited again.
+
+The retained raw tree was compacted without modifying its source:
+
+- 8,362 files to 53 files across 34 partitions;
+- 2,331,346 rows and 2,331,346 unique IDs before and after;
+- 453,728,434 exact payload bytes before and after;
+- content digest
+  `d001dddf13ef8c797117a5a3de0e0b49a519d8b388f6cd4a96514e578e894ecd`.
+
+The recorded pre-release implementation run produced 32,478 audited snapshots in each replay
+(21,642 single-venue and 10,836 cross-venue), zero no-lookahead violations, zero signals,
+orders, or private-API calls, and exact logical digest
+`782a997fc98e6ac3ce1f8a5ade0c5943fc9cdeb9939d84bc71a0fe1bb31b575e` in both trees.
+The two physical trees deliberately differed (198 versus 252 files) while their logical records
+remained identical. Replay throughput was 1,666 and 1,511 raw records/second, respectively,
+or 1.29× and 1.17× the captured wall-clock rate.
+
+This evidence also exposes a real limitation: all retained fixed-set snapshots have at least one
+structured unavailable reason. The configured Z-score history is 1,800 seconds, while the
+decision span is only about 1,805 seconds and some required metric histories start later. The
+fixed set therefore proves deterministic unavailable-path behavior, formula/reference paths in
+tests, persistence, and performance; it does not prove a fully warm and aligned live
+cross-venue path.
+
+## Phase 3 stability observation
+
+Run repeated acceptance toward a six-hour process-lifetime target:
+
+```powershell
+cvf stability-phase3 `
+  --input data\processed\phase3-acceptance\raw-compacted `
+  --output data\processed\phase3-acceptance\stability-v0.3.0 `
+  --target-hours 6
+```
+
+`--maximum-iterations 1` verifies the harness and emits an honest pending result, but is not a
+six-hour acceptance. The recorded two-replay observation totals about 49.04 minutes. A true
+six-hour continuous live-feed/reconnect/resynchronization observation has not been performed
+and remains a release limitation; repeated fixed-data process time must not be described as
+equivalent evidence.
 
 ## Current official protocol decisions
 

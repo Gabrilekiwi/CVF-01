@@ -215,7 +215,26 @@ different batch boundaries but must have identical IDs, canonical payloads, code
 partitions, scopes, and decision bounds. Float values are exact persisted inputs; no unstated
 tolerance is applied.
 
-## 5. Signal model
+## 5. Acceptance artifacts
+
+Acceptance summaries and checkpoints are operational evidence, not normalized market events.
+They are written outside the feature Parquet tree and include:
+
+| Field family | Meaning |
+|---|---|
+| input identity | raw path/audit, settings fingerprint, package-source SHA-256, replay order |
+| checkpoint state | `REPLAY_COMPLETE` or `AUDIT_COMPLETE`, output path, writer batch/flush settings |
+| replay | raw/normalized/skipped counts, event/state outcomes, decision span, wall/CPU time |
+| performance | throughput and captured-rate multiplier, initial/final/peak RSS, calculation/receive/write latency |
+| persistence | accepted/deduplicated snapshots, files, flushes, backpressure, worker error, feature audit |
+| correctness | no-lookahead violations, per-tree digest, exact comparison, warm/health/reason counts |
+| safety | signal, order, and private-API counters |
+| stability | requested and actually observed seconds, completion/pending status, per-iteration results |
+
+The requested stability duration is never substituted for actual observation time. A capped or
+interrupted run remains machine-readably incomplete.
+
+## 6. Signal model
 
 `TradingSignal` adds:
 
@@ -237,7 +256,7 @@ tolerance is applied.
 
 Long entry levels satisfy `stop < entry < TP1 < TP2`; short levels are symmetric.
 
-## 6. Paper-trading models
+## 7. Paper-trading models
 
 ### `SimulatedOrder`
 
@@ -255,7 +274,7 @@ remaining quantity.
 Represents one fill or exit slice with order/position IDs, purpose, side, execution price,
 quantity, fee, slippage, realized PnL, and execution time.
 
-## 7. Symbol mapping
+## 8. Symbol mapping
 
 | Canonical | Binance | OKX perpetual | OKX index instrument |
 |---|---|---|---|
@@ -265,7 +284,7 @@ quantity, fee, slippage, realized PnL, and execution time.
 Mapping is exact and fail-closed. The OKX index instrument is converted to its configured
 perpetual canonical symbol only inside the index-channel mapping.
 
-## 8. Raw Parquet schema
+## 9. Raw Parquet schema
 
 Implemented layout:
 
