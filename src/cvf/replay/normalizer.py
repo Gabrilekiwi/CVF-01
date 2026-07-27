@@ -54,5 +54,18 @@ class RawRecordNormalizer:
                 self._okx_specifications.update(specifications)
                 self._okx = OkxNormalizer(self._okx_specifications)
                 return []
+            if record.channel == "liquidation-orders" and isinstance(payload, dict):
+                data = payload.get("data")
+                if isinstance(data, list):
+                    configured_data = [
+                        item
+                        for item in data
+                        if isinstance(item, dict)
+                        and isinstance(item.get("instId"), str)
+                        and item["instId"].upper() in self._okx_specifications
+                    ]
+                    if not configured_data:
+                        return []
+                    payload = {**payload, "data": configured_data}
             return self._okx.normalize(payload, context=context)
         return []

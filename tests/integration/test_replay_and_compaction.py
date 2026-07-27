@@ -16,9 +16,9 @@ import pytest
 from cvf.clock import DecisionScheduler, DecisionTick, TickKind
 from cvf.config import load_settings
 from cvf.features import FeatureStatePipeline, MarketStateStore
-from cvf.models import Exchange, Trade
+from cvf.models import Exchange, LiquidationEvent, Trade
 from cvf.pipeline import NormalizedEventBus
-from cvf.replay import RawParquetReader, ReplayOrder, ReplayRunner
+from cvf.replay import RawParquetReader, RawRecordNormalizer, ReplayOrder, ReplayRunner
 from cvf.storage import AsyncPartitionedParquetWriter, RawMarketRecord, compact_raw_tree
 
 NOW = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
@@ -61,6 +61,45 @@ def agg_trade(sequence: int, offset_ms: int) -> RawMarketRecord:
         connection_generation=3,
         raw_payload=json.dumps(payload, separators=(",", ":")).encode(),
     )
+
+
+def test_okx_replay_filters_unconfigured_liquidation_instruments() -> None:
+    normalizer = RawRecordNormalizer()
+    metadata = RawMarketRecord(
+        exchange=Exchange.OKX,
+        symbol="BTC-USDT-PERP",
+        channel="instrument_metadata",
+        message_kind="market_data",
+        transport="rest",
+        local_receive_timestamp=NOW,
+        connection_generation=0,
+        raw_payload=Path("tests/fixtures/okx/instrument_btc_live.json").read_bytes(),
+    )
+    assert normalizer.normalize(metadata) == []
+
+    payload = json.loads(
+        Path("tests/fixtures/okx/liquidation_official.json").read_text(encoding="utf-8")
+    )
+    unrelated = dict(payload["data"][0])
+    unrelated["instId"] = "O-USDT-SWAP"
+    payload["data"].append(unrelated)
+    record = RawMarketRecord(
+        exchange=Exchange.OKX,
+        symbol="*",
+        channel="liquidation-orders",
+        message_kind="market_data",
+        transport="websocket",
+        exchange_timestamp=NOW,
+        local_receive_timestamp=NOW,
+        connection_generation=1,
+        raw_payload=json.dumps(payload, separators=(",", ":")).encode(),
+    )
+
+    events = normalizer.normalize(record)
+
+    assert len(events) == 1
+    assert isinstance(events[0], LiquidationEvent)
+    assert events[0].symbol == "BTC-USDT-PERP"
 
 
 @pytest.mark.asyncio
