@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -34,6 +32,7 @@ from cvf.features.models import (
     StrengthAgreement,
 )
 from cvf.models.enums import Exchange
+from cvf.utils.fingerprint import settings_fingerprint
 
 
 def _utc(value: datetime) -> datetime:
@@ -143,12 +142,7 @@ class CrossVenueFeatureEngine:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        serialized = json.dumps(
-            settings.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        self.config_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        self.config_hash = settings_fingerprint(settings)
 
     def calculate(
         self,

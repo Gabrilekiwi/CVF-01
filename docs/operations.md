@@ -1,4 +1,4 @@
-# CVF-01 Phase-2/2.5 Operations
+# CVF-01 Operations
 
 ## Install and preflight
 
@@ -119,6 +119,48 @@ speed preserves recorded timing; zero runs as fast as processing allows.
 Input and output must be disjoint, and a nonempty output is rejected. The command audits both
 trees and succeeds only when row count, UUID uniqueness, exact content digest, payload bytes,
 lineage, and partitions agree. The source tree remains read-only.
+
+## Feature persistence audit
+
+Feature writers use the processed root and always add the version partition:
+
+```text
+data/processed/feature_schema=v1/date=.../symbol=.../scope=...
+```
+
+Audit a full tree:
+
+```powershell
+.\.venv\Scripts\python.exe -m cvf audit-features `
+  --input data\processed
+```
+
+Filters are inclusive and may repeat:
+
+```powershell
+.\.venv\Scripts\python.exe -m cvf audit-features `
+  --input data\processed `
+  --start 2026-07-27T00:00:00Z `
+  --end 2026-07-27T00:30:00Z `
+  --scope CROSS_VENUE `
+  --symbol BTC-USDT-PERP `
+  --window 5
+```
+
+Compare separately generated live and replay feature trees:
+
+```powershell
+.\.venv\Scripts\python.exe -m cvf compare-features `
+  --left data\acceptance\live `
+  --right data\acceptance\replay
+```
+
+Exit `0` means logical content is exactly equal. Different Parquet file counts and batch
+boundaries are permitted; IDs, canonical payload hashes, code/config lineage, partitions,
+scopes, and decision-time bounds must match. A mismatch exits `1`.
+
+Treat any schema, payload hash, metadata/payload, partition, duplicate-ID, or consistency error
+as a failed run. Do not manually edit or merge feature files.
 
 ## Current official protocol decisions
 

@@ -2,10 +2,10 @@
 
 ## Scope
 
-CVF-01 remains a modular monolith and paper-trading research system. Phase 3C deterministically
-aligns typed Binance/OKX observations over the bounded feature state shared by live collection
-and replay. It contains no credentials, private APIs, market scores, signals, or order
-execution.
+CVF-01 remains a modular monolith and paper-trading research system. Phase 3D persists the
+deterministic single-venue and cross-venue observations shared by live collection and replay in
+an audited, versioned feature tree. It contains no credentials, private APIs, market scores,
+signals, or order execution.
 
 | Area | Phase-2 status |
 |---|---|
@@ -21,7 +21,8 @@ execution.
 | Bounded venue/symbol state and feature availability | Implemented |
 | Deterministic single-venue feature calculations | Implemented |
 | Deterministic cross-venue alignment and research features | Implemented |
-| Feature persistence, signals, trading, backtests, UI | Not active |
+| Versioned feature persistence and live/replay consistency audit | Implemented |
+| Signals, trading, backtests, UI | Not active |
 
 ## Implemented data flow
 
@@ -49,7 +50,8 @@ flowchart LR
     BUS --> STATE["Bounded feature state"]
     STATE --> VF["Single-venue features"]
     VF --> XV["Phase-3C cross-venue alignment"]
-    XV --> NEXT["Phase-3D feature persistence"]
+    XV --> FP["Phase-3D feature Parquet"]
+    FP --> FA["Schema + lineage + consistency audit"]
     PQ --> RR["Stable raw reader"]
     RR --> RN["Live normalizers"]
     RN --> BUS
@@ -100,6 +102,24 @@ Confirmation/divergence values are typed research observations, not market score
 signals. Lead/lag fields deliberately remain unavailable until independently validated
 event-time history exists; local receive order is never accepted as evidence of venue
 leadership.
+
+`AsyncFeatureParquetWriter` accepts only typed market-feature snapshots whose strategy,
+code version, and configuration hash match the writer. Its queue, batch, flush interval, and
+deduplication cache are bounded and configurable. A full queue applies observable producer
+backpressure. Files are grouped by schema/date/symbol/scope, sorted by a stable decision-time
+key, written to a temporary sibling, and atomically replaced. File names include an input
+content digest rather than process time.
+
+The stored row contains directly queryable audit columns plus a canonical validation-compatible
+JSON payload and SHA-256. `FeatureParquetReader` checks the exact Arrow schema, payload hash,
+canonical encoding, typed model validation, metadata/payload agreement, and physical partition
+before returning a record. Files are merged in stable decision-time order and duplicate feature
+IDs fail closed.
+
+`audit_feature_tree` produces an order-independent logical content digest with source version,
+scope, partition, ID, and time-bound summaries. `compare_feature_trees` requires all logical
+content to match while permitting different physical batch/file boundaries. There is no implicit
+floating tolerance: the canonical persisted values must agree exactly.
 
 ## Connector lifecycle
 

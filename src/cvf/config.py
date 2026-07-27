@@ -295,6 +295,10 @@ class StorageConfig(FrozenConfigModel):
     parquet_batch_rows: int = Field(gt=0)
     parquet_flush_seconds: float = Field(gt=0)
     parquet_queue_capacity: int = Field(default=50_000, gt=0)
+    feature_parquet_batch_rows: int = Field(default=10_000, gt=0)
+    feature_parquet_flush_seconds: float = Field(default=5, gt=0)
+    feature_parquet_queue_capacity: int = Field(default=50_000, gt=0)
+    feature_deduplication_capacity: int = Field(default=500_000, gt=0)
     database_batch_rows: int = Field(gt=0)
     database_flush_seconds: float = Field(gt=0)
 
