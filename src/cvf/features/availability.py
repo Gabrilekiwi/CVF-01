@@ -41,7 +41,7 @@ def evaluate_availability(
         raise ValueError("open_interest_stale_after must be positive")
     reasons: list[FeatureUnavailableReason] = []
 
-    if not any(item.timestamp <= decision_at for item in state.trades):
+    if state.trades.latest_at_or_before(decision_at) is None:
         reasons.append(
             FeatureUnavailableReason(
                 code=FeatureUnavailableCode.NO_TRADES,
@@ -57,8 +57,8 @@ def evaluate_availability(
                 channel="order_book",
             )
         )
-    book_items = list(state.book_updates)
-    if not book_items or book_items[0].timestamp > decision_at - warmup:
+    earliest_book = state.book_updates.earliest
+    if earliest_book is None or earliest_book.timestamp > decision_at - warmup:
         reasons.append(
             FeatureUnavailableReason(
                 code=FeatureUnavailableCode.BOOK_GENERATION_WARMUP,
@@ -66,14 +66,8 @@ def evaluate_availability(
                 channel="order_book",
             )
         )
-    latest_oi = next(
-        (
-            item.value
-            for item in reversed(list(state.open_interest))
-            if item.timestamp <= decision_at
-        ),
-        None,
-    )
+    latest_oi_item = state.open_interest.latest_at_or_before(decision_at)
+    latest_oi = None if latest_oi_item is None else latest_oi_item.value
     if latest_oi is None:
         reasons.append(
             FeatureUnavailableReason(

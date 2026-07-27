@@ -285,6 +285,12 @@ async def test_partial_batch_flushes_on_close() -> None:
 
         assert writer.stats.written_snapshots == 1
         assert writer.stats.flush_count == 1
+        assert writer.stats.average_write_latency_ms is not None
+        assert writer.stats.last_write_latency_ms is not None
+        assert writer.stats.maximum_write_latency_ms is not None
+        assert writer.stats.average_write_latency_ms >= 0
+        assert writer.stats.last_write_latency_ms >= 0
+        assert writer.stats.maximum_write_latency_ms >= writer.stats.last_write_latency_ms
 
 
 @pytest.mark.asyncio
@@ -465,6 +471,37 @@ async def test_reader_filters_warm_and_healthy_flags() -> None:
         assert [record.feature_snapshot_id for record in selected] == [UUID(int=701)]
 
 
+@pytest.mark.asyncio
+async def test_reader_filters_schema_snapshot_id_and_unavailable_reason() -> None:
+    with scratch_directory() as temporary:
+        available = single(Exchange.BINANCE, identifier=711)
+        unavailable = single(Exchange.OKX, identifier=712, warm=False)
+        await write_tree(temporary, [available, unavailable])
+
+        selected = list(
+            FeatureParquetReader(temporary).iter_records(
+                filters=FeatureScanFilter(
+                    schema_versions=frozenset({1}),
+                    snapshot_ids=frozenset({unavailable.feature_snapshot_id}),
+                    unavailable_codes=frozenset(
+                        {FeatureUnavailableCode.NOT_WARM}
+                    ),
+                )
+            )
+        )
+        assert [record.feature_snapshot_id for record in selected] == [
+            unavailable.feature_snapshot_id
+        ]
+        assert (
+            list(
+                FeatureParquetReader(temporary).iter_records(
+                    filters=FeatureScanFilter(schema_versions=frozenset({2}))
+                )
+            )
+            == []
+        )
+
+
 def test_scan_filter_rejects_naive_reversed_and_invalid_values() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         FeatureScanFilter(start=datetime(2026, 7, 27))
@@ -472,6 +509,8 @@ def test_scan_filter_rejects_naive_reversed_and_invalid_values() -> None:
         FeatureScanFilter(start=NOW, end=NOW - timedelta(seconds=1))
     with pytest.raises(ValueError, match="positive"):
         FeatureScanFilter(windows=frozenset({0}))
+    with pytest.raises(ValueError, match="schema versions"):
+        FeatureScanFilter(schema_versions=frozenset({0}))
     with pytest.raises(ValueError, match="feature-producing"):
         FeatureScanFilter(scopes=frozenset({Exchange.SIMULATED}))
 
@@ -562,8 +601,26 @@ async def test_audit_reports_lineage_scope_and_time_bounds() -> None:
         assert audit.scopes == ("BINANCE", "CROSS_VENUE", "OKX")
         assert audit.code_versions == ("0.2.1",)
         assert audit.config_hashes
+        assert audit.unavailable_snapshots == 1
+        assert audit.unavailable_reason_counts == {
+            "FEATURE_INPUT_MISSING": 6,
+            "INSUFFICIENT_HISTORY": 1,
+        }
         assert audit.earliest_decision_timestamp == NOW
         assert audit.latest_decision_timestamp == NOW + timedelta(seconds=2)
+
+
+@pytest.mark.asyncio
+async def test_audit_summarizes_structured_unavailable_reasons() -> None:
+    with scratch_directory() as temporary:
+        await write_tree(
+            temporary,
+            [single(Exchange.BINANCE, identifier=851, warm=False)],
+        )
+
+        audit = audit_feature_tree(temporary)
+        assert audit.unavailable_snapshots == 1
+        assert audit.unavailable_reason_counts == {"NOT_WARM": 1}
 
 
 @pytest.mark.asyncio

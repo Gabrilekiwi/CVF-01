@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from types import FrameType
 from typing import Any, NoReturn
+from uuid import UUID
 
 from pydantic import ValidationError
 
@@ -20,6 +21,7 @@ from cvf.config import ConfigError, Settings, load_settings
 from cvf.exchanges.base import ExchangeConnector
 from cvf.exchanges.binance import BinanceMarketDataConnector
 from cvf.exchanges.okx import OKXMarketDataConnector
+from cvf.features.models import FeatureUnavailableCode
 from cvf.logging_config import configure_logging
 from cvf.models.enums import Exchange
 from cvf.replay import RawParquetReader, RawScanFilter, ReplayOrder, ReplayRunner
@@ -338,6 +340,23 @@ def _parser() -> argparse.ArgumentParser:
     )
     audit_features.add_argument("--symbol", action="append")
     audit_features.add_argument("--window", action="append", type=int)
+    audit_features.add_argument("--schema-version", action="append", type=int)
+    audit_features.add_argument("--snapshot-id", action="append", type=UUID)
+    audit_features.add_argument(
+        "--unavailable-reason",
+        action="append",
+        choices=list(FeatureUnavailableCode),
+    )
+    audit_features.add_argument(
+        "--warm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    audit_features.add_argument(
+        "--healthy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     compare_features = subparsers.add_parser(
         "compare-features",
         help="Require two feature trees to have identical logical content",
@@ -414,6 +433,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 windows=(
                     None if not args.window else frozenset(args.window)
                 ),
+                schema_versions=(
+                    None
+                    if not args.schema_version
+                    else frozenset(args.schema_version)
+                ),
+                snapshot_ids=(
+                    None
+                    if not args.snapshot_id
+                    else frozenset(args.snapshot_id)
+                ),
+                unavailable_codes=(
+                    None
+                    if not args.unavailable_reason
+                    else frozenset(
+                        FeatureUnavailableCode(value)
+                        for value in args.unavailable_reason
+                    )
+                ),
+                is_warm=args.warm,
+                is_healthy=args.healthy,
             )
             audit = audit_feature_tree(args.input, filters=feature_filter)
             logging.getLogger("cvf").info(

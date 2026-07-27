@@ -80,6 +80,14 @@ class BoundedTimeWindow[T]:
         return iter(self._items)
 
     @property
+    def earliest(self) -> TimedValue[T] | None:
+        return None if not self._items else self._items[0]
+
+    @property
+    def latest(self) -> TimedValue[T] | None:
+        return None if not self._items else self._items[-1]
+
+    @property
     def stats(self) -> WindowStats:
         return WindowStats(
             size=len(self),
@@ -127,22 +135,43 @@ class BoundedTimeWindow[T]:
         self._prune()
         return AppendStatus.ACCEPTED
 
-    def values_between(self, start_exclusive: datetime, end_inclusive: datetime) -> list[T]:
-        """Return the explicit trailing interval ``(start, end]``."""
+    def items_between(
+        self,
+        start_exclusive: datetime,
+        end_inclusive: datetime,
+    ) -> list[TimedValue[T]]:
+        """Return timestamped items in ``(start, end]`` without scanning older history."""
 
         start = _utc(start_exclusive)
         end = _utc(end_inclusive)
         if end < start:
             raise ValueError("window end cannot precede start")
-        result: list[T] = []
+        result: list[TimedValue[T]] = []
         for item in reversed(self._items):
             if item.timestamp > end:
                 continue
             if item.timestamp <= start:
                 break
-            result.append(item.value)
+            result.append(item)
         result.reverse()
         return result
+
+    def values_between(self, start_exclusive: datetime, end_inclusive: datetime) -> list[T]:
+        """Return values in the explicit trailing interval ``(start, end]``."""
+
+        return [
+            item.value
+            for item in self.items_between(start_exclusive, end_inclusive)
+        ]
+
+    def latest_at_or_before(self, boundary: datetime) -> TimedValue[T] | None:
+        """Return the newest item at or before a deterministic decision boundary."""
+
+        end = _utc(boundary)
+        for item in reversed(self._items):
+            if item.timestamp <= end:
+                return item
+        return None
 
     def clear(self) -> None:
         self._items.clear()

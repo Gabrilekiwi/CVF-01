@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 
+from cvf.clock import DecisionScheduler, DecisionTick, TickKind
 from cvf.config import load_settings
 from cvf.features import FeatureStatePipeline, MarketStateStore
 from cvf.models import Exchange, Trade
@@ -159,6 +160,39 @@ async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
         assert replayed[0].quantity == replayed[0].contract_quantity * Decimal("0.01")
         assert summary.raw_records == 2
         assert summary.skipped_records == 1
+
+
+@pytest.mark.asyncio
+async def test_replay_ticks_include_all_events_at_the_decision_boundary() -> None:
+    bus = NormalizedEventBus(default_queue_capacity=2)
+    feature_state = FeatureStatePipeline(
+        MarketStateStore(load_settings(environ={}).features)
+    )
+    bus.register("feature-state", feature_state.consume)
+    observed_trade_counts: list[tuple[datetime, int]] = []
+
+    async def capture_tick(tick: DecisionTick) -> None:
+        if tick.kind is not TickKind.FEATURE:
+            return
+        state = feature_state.store.state(Exchange.BINANCE, "BTC-USDT-PERP")
+        observed_trade_counts.append((tick.timestamp, len(state.trades)))
+
+    scheduler = DecisionScheduler(
+        start=NOW,
+        feature_interval=timedelta(seconds=1),
+        signal_interval=timedelta(seconds=60),
+    )
+    await ReplayRunner(
+        event_bus=bus,
+        scheduler=scheduler,
+        tick_sink=capture_tick,
+        speed=0,
+    ).run([agg_trade(1, 1_000), agg_trade(2, 2_000)])
+
+    assert observed_trade_counts == [
+        (NOW + timedelta(seconds=1), 1),
+        (NOW + timedelta(seconds=2), 2),
+    ]
 
 
 @pytest.mark.asyncio

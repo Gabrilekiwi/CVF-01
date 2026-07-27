@@ -581,4 +581,6 @@ class CrossVenueFeatureSnapshot(EventBase):
             raise ValueError("unavailable alignments cannot expose paired feature groups")
         if self.is_healthy and self.alignment.status is not AlignmentStatus.ALIGNED:
             raise ValueError("only aligned snapshots can be healthy")
+        if (not self.is_warm or not self.is_healthy) and not self.unavailable_reasons:
+            raise ValueError("unavailable cross-venue snapshots require structured reasons")
         return self
