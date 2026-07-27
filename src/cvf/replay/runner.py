@@ -67,7 +67,6 @@ class ReplayRunner:
             if self._scheduler is None:
                 return
             if not self._scheduler.has_due_tick(target):
-                self._scheduler.advance_to(target)
                 return
             await self._event_bus.drain()
             for tick in self._scheduler.advance_to(target):

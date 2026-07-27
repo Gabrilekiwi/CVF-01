@@ -108,6 +108,30 @@ async def test_phase3_acceptance_replays_twice_and_writes_evidence() -> None:
         assert not report.full_stability_duration_completed
         assert (output / "summary.json").is_file()
         assert (output / "summary.md").is_file()
+        assert (output / "run-1-metrics.json").is_file()
+        assert (output / "run-2-metrics.json").is_file()
+
+        run_one_checkpoint = output / "run-1-metrics.json"
+        checkpoint_payload = json.loads(run_one_checkpoint.read_text(encoding="utf-8"))
+        checkpoint_payload["stage"] = "REPLAY_COMPLETE"
+        run_one_checkpoint.write_text(
+            json.dumps(checkpoint_payload),
+            encoding="utf-8",
+        )
+        resumed = await run_phase3_acceptance(
+            load_settings(environ={}),
+            input_path=raw,
+            output_path=output,
+            first_batch_rows=2,
+            second_batch_rows=3,
+            requested_stability_seconds=3_600,
+            resume=True,
+        )
+
+        assert resumed.first_run == report.first_run
+        assert resumed.second_run == report.second_run
+        recovered_payload = json.loads(run_one_checkpoint.read_text(encoding="utf-8"))
+        assert recovered_payload["stage"] == "AUDIT_COMPLETE"
 
 
 @pytest.mark.asyncio

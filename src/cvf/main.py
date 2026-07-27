@@ -385,6 +385,11 @@ def _parser() -> argparse.ArgumentParser:
         default=6.0,
         help="Acceptance target recorded honestly against actual observed wall time",
     )
+    phase3_acceptance.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse code/settings-matched, re-audited per-run checkpoints",
+    )
     phase3_stability = subparsers.add_parser(
         "stability-phase3",
         help="Repeat fixed-data acceptance toward a six-hour wall-clock target",
@@ -529,6 +534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     requested_stability_seconds=(
                         args.requested_stability_hours * 60 * 60
                     ),
+                    resume=args.resume,
                 )
             )
             logging.getLogger("cvf").info(

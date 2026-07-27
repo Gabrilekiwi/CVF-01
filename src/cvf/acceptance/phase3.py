@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import json
 import os
 import sys
 import time
 from collections import Counter, deque
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from itertools import chain
 from pathlib import Path
+from typing import Final, Literal
 
+from pydantic import TypeAdapter
+
+from cvf import __version__
 from cvf.clock import DecisionScheduler, DecisionTick, TickKind
 from cvf.config import Settings
 from cvf.features import (
@@ -51,6 +56,7 @@ from cvf.storage.features import (
     compare_feature_audits,
 )
 from cvf.storage.raw import RawMarketRecord
+from cvf.utils.fingerprint import settings_fingerprint
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +105,7 @@ class Phase3RunMetrics:
     signal_outputs: int
     order_outputs: int
     private_api_requests: int
+    writer_batch_rows: int
     writer_flush_seconds: float
     throughput_records_per_second: float
     throughput_event_time_multiplier: float | None
@@ -124,6 +131,20 @@ class Phase3AcceptanceReport:
     actual_stability_observation_seconds: float
     full_stability_duration_completed: bool
     full_stability_status: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Phase3RunCheckpoint:
+    schema_version: int
+    stage: Literal["REPLAY_COMPLETE", "AUDIT_COMPLETE"]
+    package_source_sha256: str
+    settings_sha256: str
+    metrics: Phase3RunMetrics
+
+
+_RUN_CHECKPOINT_ADAPTER: Final[TypeAdapter[_Phase3RunCheckpoint]] = TypeAdapter(
+    _Phase3RunCheckpoint
+)
 
 
 class _LatencyAccumulator:
@@ -155,7 +176,7 @@ class _EventObserver:
         self.book_generations: dict[tuple[Exchange, str], int] = {}
         self.book_generation_rebuilds = 0
 
-    async def consume(self, event: NormalizedMarketEvent) -> None:
+    def observe(self, event: NormalizedMarketEvent) -> None:
         receive_latency_ms = (
             event.local_receive_timestamp - event.exchange_timestamp
         ).total_seconds() * 1000.0
@@ -383,6 +404,7 @@ async def _run_once(
     output_path: Path,
     batch_rows: int,
     writer_flush_seconds: float,
+    on_replay_complete: Callable[[Phase3RunMetrics], None] | None = None,
 ) -> Phase3RunMetrics:
     if output_path.exists() and any(output_path.iterdir()):
         raise ValueError(f"acceptance output must be empty: {output_path}")
@@ -398,14 +420,13 @@ async def _run_once(
     bus = NormalizedEventBus(
         default_queue_capacity=settings.pipeline.consumer_queue_capacity
     )
+    async def consume_feature_state(event: NormalizedMarketEvent) -> None:
+        await feature_state.consume(event)
+        observer.observe(event)
+
     bus.register(
         "feature-state",
-        feature_state.consume,
-        queue_capacity=settings.pipeline.consumer_queue_capacity,
-    )
-    bus.register(
-        "acceptance-observer",
-        observer.consume,
+        consume_feature_state,
         queue_capacity=settings.pipeline.consumer_queue_capacity,
     )
     writer = AsyncFeatureParquetWriter(
@@ -449,7 +470,6 @@ async def _run_once(
     wall_duration = time.perf_counter() - wall_started
     cpu_duration = time.process_time() - cpu_started
     rss_samples.append(_current_rss_bytes())
-    feature_audit = await asyncio.to_thread(audit_raw_feature_tree, output_path)
     event_span = (
         None
         if replay.started_at is None or replay.finished_at is None
@@ -476,7 +496,7 @@ async def _run_once(
             0.0 if wall_duration == 0 else cpu_duration / wall_duration * 100.0
         ),
     )
-    return Phase3RunMetrics(
+    replay_metrics = Phase3RunMetrics(
         label=label,
         input_path=input_path.resolve(),
         output_path=output_path.resolve(),
@@ -484,7 +504,20 @@ async def _run_once(
         feature_state=feature_state.stats,
         consumers=bus.stats,
         writer=writer.stats,
-        feature_audit=feature_audit,
+        feature_audit=FeatureAudit(
+            rows=0,
+            files=0,
+            unique_snapshot_ids=0,
+            partitions=0,
+            content_digest="0" * 64,
+            scopes=(),
+            code_versions=(),
+            config_hashes=(),
+            unavailable_reason_counts={},
+            unavailable_snapshots=0,
+            earliest_decision_timestamp=None,
+            latest_decision_timestamp=None,
+        ),
         resources=resources,
         event_receive_latency=observer.receive_latency.metrics,
         feature_calculation_latency=tick_sink.calculation_latency.metrics,
@@ -502,10 +535,15 @@ async def _run_once(
         signal_outputs=0,
         order_outputs=0,
         private_api_requests=0,
+        writer_batch_rows=batch_rows,
         writer_flush_seconds=writer_flush_seconds,
         throughput_records_per_second=throughput,
         throughput_event_time_multiplier=multiplier,
     )
+    if on_replay_complete is not None:
+        on_replay_complete(replay_metrics)
+    feature_audit = await asyncio.to_thread(audit_raw_feature_tree, output_path)
+    return replace(replay_metrics, feature_audit=feature_audit)
 
 
 def audit_raw_feature_tree(root: Path) -> FeatureAudit:
@@ -524,6 +562,143 @@ def _json_default(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
     raise TypeError(f"cannot serialize {type(value).__name__}")
+
+
+def _package_source_sha256() -> str:
+    package_root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for path in sorted(package_root.rglob("*.py")):
+        digest.update(path.relative_to(package_root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _write_run_checkpoint(
+    path: Path,
+    *,
+    stage: Literal["REPLAY_COMPLETE", "AUDIT_COMPLETE"],
+    settings: Settings,
+    package_source_sha256: str,
+    metrics: Phase3RunMetrics,
+) -> None:
+    checkpoint = _Phase3RunCheckpoint(
+        schema_version=1,
+        stage=stage,
+        package_source_sha256=package_source_sha256,
+        settings_sha256=settings_fingerprint(settings),
+        metrics=metrics,
+    )
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_bytes(_RUN_CHECKPOINT_ADAPTER.dump_json(checkpoint, indent=2) + b"\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+async def _load_run_checkpoint(
+    path: Path,
+    *,
+    settings: Settings,
+    package_source_sha256: str,
+    expected_label: str,
+    expected_input_path: Path,
+    expected_output_path: Path,
+    expected_batch_rows: int,
+    expected_flush_seconds: float,
+) -> Phase3RunMetrics:
+    checkpoint = _RUN_CHECKPOINT_ADAPTER.validate_json(path.read_bytes())
+    if checkpoint.schema_version != 1:
+        raise ValueError(f"unsupported Phase 3 checkpoint schema: {path}")
+    if checkpoint.package_source_sha256 != package_source_sha256:
+        raise ValueError(f"Phase 3 checkpoint code does not match current source: {path}")
+    if checkpoint.settings_sha256 != settings_fingerprint(settings):
+        raise ValueError(f"Phase 3 checkpoint settings do not match: {path}")
+    metrics = checkpoint.metrics
+    if (
+        metrics.label != expected_label
+        or metrics.input_path.resolve() != expected_input_path
+        or metrics.output_path.resolve() != expected_output_path
+        or metrics.writer_batch_rows != expected_batch_rows
+        or metrics.writer_flush_seconds != expected_flush_seconds
+    ):
+        raise ValueError(f"Phase 3 checkpoint run parameters do not match: {path}")
+    current_audit = await asyncio.to_thread(
+        audit_raw_feature_tree,
+        expected_output_path,
+    )
+    if checkpoint.stage == "REPLAY_COMPLETE":
+        metrics = replace(metrics, feature_audit=current_audit)
+        _write_run_checkpoint(
+            path,
+            stage="AUDIT_COMPLETE",
+            settings=settings,
+            package_source_sha256=package_source_sha256,
+            metrics=metrics,
+        )
+    elif checkpoint.stage == "AUDIT_COMPLETE" and current_audit != metrics.feature_audit:
+        raise ValueError(f"Phase 3 checkpoint feature tree changed: {path}")
+    if metrics.feature_audit.code_versions != (__version__,):
+        raise ValueError(f"Phase 3 checkpoint package version does not match: {path}")
+    return metrics
+
+
+async def _run_or_resume(
+    *,
+    label: str,
+    settings: Settings,
+    input_path: Path,
+    destination: Path,
+    batch_rows: int,
+    writer_flush_seconds: float,
+    resume: bool,
+    package_source_sha256: str,
+) -> Phase3RunMetrics:
+    output_path = destination / label
+    checkpoint_path = destination / f"{label}-metrics.json"
+    if resume and checkpoint_path.is_file():
+        return await _load_run_checkpoint(
+            checkpoint_path,
+            settings=settings,
+            package_source_sha256=package_source_sha256,
+            expected_label=label,
+            expected_input_path=input_path,
+            expected_output_path=output_path.resolve(),
+            expected_batch_rows=batch_rows,
+            expected_flush_seconds=writer_flush_seconds,
+        )
+    if output_path.exists() and any(output_path.iterdir()):
+        raise ValueError(
+            f"partial Phase 3 output has no reusable checkpoint: {output_path}"
+        )
+    def save_replay_checkpoint(metrics: Phase3RunMetrics) -> None:
+        _write_run_checkpoint(
+            checkpoint_path,
+            stage="REPLAY_COMPLETE",
+            settings=settings,
+            package_source_sha256=package_source_sha256,
+            metrics=metrics,
+        )
+
+    metrics = await _run_once(
+        label=label,
+        settings=settings,
+        input_path=input_path,
+        output_path=output_path,
+        batch_rows=batch_rows,
+        writer_flush_seconds=writer_flush_seconds,
+        on_replay_complete=save_replay_checkpoint,
+    )
+    _write_run_checkpoint(
+        checkpoint_path,
+        stage="AUDIT_COMPLETE",
+        settings=settings,
+        package_source_sha256=package_source_sha256,
+        metrics=metrics,
+    )
+    return metrics
 
 
 def _percentage(numerator: int, denominator: int) -> float:
@@ -662,6 +837,7 @@ async def run_phase3_acceptance(
     second_batch_rows: int = 777,
     writer_flush_seconds: float = 60,
     requested_stability_seconds: float = 6 * 60 * 60,
+    resume: bool = False,
 ) -> Phase3AcceptanceReport:
     """Audit input, replay twice, compare exact feature content, and write evidence."""
 
@@ -677,26 +853,31 @@ async def run_phase3_acceptance(
         raise ValueError(f"fixed dataset does not exist: {source}")
     if source == destination or source in destination.parents or destination in source.parents:
         raise ValueError("acceptance input and output must be disjoint")
-    if destination.exists() and any(destination.iterdir()):
+    if not resume and destination.exists() and any(destination.iterdir()):
         raise ValueError("acceptance output directory must be empty")
     destination.mkdir(parents=True, exist_ok=True)
 
     raw_audit = await asyncio.to_thread(audit_raw_tree, source)
-    first = await _run_once(
+    package_source_sha256 = _package_source_sha256()
+    first = await _run_or_resume(
         label="run-1",
         settings=settings,
         input_path=source,
-        output_path=destination / "run-1",
+        destination=destination,
         batch_rows=first_batch_rows,
         writer_flush_seconds=writer_flush_seconds,
+        resume=resume,
+        package_source_sha256=package_source_sha256,
     )
-    second = await _run_once(
+    second = await _run_or_resume(
         label="run-2",
         settings=settings,
         input_path=source,
-        output_path=destination / "run-2",
+        destination=destination,
         batch_rows=second_batch_rows,
         writer_flush_seconds=writer_flush_seconds,
+        resume=resume,
+        package_source_sha256=package_source_sha256,
     )
     consistency = compare_feature_audits(
         first.output_path,
