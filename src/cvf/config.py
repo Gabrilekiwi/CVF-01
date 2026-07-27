@@ -127,6 +127,11 @@ class FeaturesConfig(FrozenConfigModel):
     large_trade_notional_usdt: Decimal = Field(default=Decimal("100000"), gt=0)
     depth_walk_notional_usdt: Decimal = Field(default=Decimal("10000"), gt=0)
     abnormal_jump_zscore: float = Field(default=4.0, gt=0)
+    cross_venue_max_snapshot_age_ms: int = Field(default=2_000, gt=0)
+    cross_venue_max_time_difference_ms: int = Field(default=500, gt=0)
+    cross_venue_zscore_minimum_samples: int = Field(default=30, ge=2)
+    cross_venue_direction_epsilon: float = Field(default=1e-12, ge=0)
+    cross_venue_strength_tolerance: float = Field(default=0.25, ge=0)
 
     @model_validator(mode="after")
     def validate_depth_weights(self) -> FeaturesConfig:

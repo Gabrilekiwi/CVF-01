@@ -2,9 +2,10 @@
 
 ## Scope
 
-CVF-01 remains a modular monolith and paper-trading research system. Phase 3B calculates typed,
-single-venue observations over the bounded feature state shared by live collection and replay.
-It contains no credentials, private APIs, market scores, signals, or order execution.
+CVF-01 remains a modular monolith and paper-trading research system. Phase 3C deterministically
+aligns typed Binance/OKX observations over the bounded feature state shared by live collection
+and replay. It contains no credentials, private APIs, market scores, signals, or order
+execution.
 
 | Area | Phase-2 status |
 |---|---|
@@ -19,7 +20,8 @@ It contains no credentials, private APIs, market scores, signals, or order execu
 | Raw scan, normalized replay, compaction audit, CI | Implemented |
 | Bounded venue/symbol state and feature availability | Implemented |
 | Deterministic single-venue feature calculations | Implemented |
-| Cross-venue features/persistence, signals, trading, backtests, UI | Not active |
+| Deterministic cross-venue alignment and research features | Implemented |
+| Feature persistence, signals, trading, backtests, UI | Not active |
 
 ## Implemented data flow
 
@@ -46,7 +48,8 @@ flowchart LR
     ON --> BUS
     BUS --> STATE["Bounded feature state"]
     STATE --> VF["Single-venue features"]
-    VF --> NEXT["Phase-3C alignment"]
+    VF --> XV["Phase-3C cross-venue alignment"]
+    XV --> NEXT["Phase-3D feature persistence"]
     PQ --> RR["Stable raw reader"]
     RR --> RN["Live normalizers"]
     RN --> BUS
@@ -79,6 +82,24 @@ calculates trade flow, sequence-valid book/OFI observations, price and volatilit
 funding/premium crowding, and public-sample liquidation activity. Feature UUIDs are derived from
 strategy, venue, symbol, window, decision time, and book source boundary. A current book that
 already includes a post-decision update is rejected instead of being silently rewound.
+
+`CrossVenueFeatureEngine` takes an unordered collection of typed single-venue snapshots and,
+for each venue, selects the deterministic latest snapshot whose decision time is not after the
+cross-venue boundary. It reports per-venue source time and age, their age/time differences,
+alignment quality, and typed `ALIGNED`, `DEGRADED`, stale, or unavailable status. Missing,
+future, stale, unhealthy, and non-warm sources remain structured reasons.
+
+Cross-venue comparisons use only venue-local normalized ratios or states. In particular,
+absolute Binance and OKX open interest is never compared. Spread Z-scores use prior paired
+decision timestamps from the supplied snapshot set; exact inputs therefore produce the same
+result regardless of iterable order or live/replay engine instance. Deterministic IDs include
+strategy, code version, config hash, symbol/window/decision boundary, both source snapshot IDs,
+and alignment status.
+
+Confirmation/divergence values are typed research observations, not market scores or trading
+signals. Lead/lag fields deliberately remain unavailable until independently validated
+event-time history exists; local receive order is never accepted as evidence of venue
+leadership.
 
 ## Connector lifecycle
 

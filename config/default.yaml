@@ -98,6 +98,11 @@ features:
   large_trade_notional_usdt: 100000
   depth_walk_notional_usdt: 10000
   abnormal_jump_zscore: 4.0
+  cross_venue_max_snapshot_age_ms: 2000
+  cross_venue_max_time_difference_ms: 500
+  cross_venue_zscore_minimum_samples: 30
+  cross_venue_direction_epsilon: 1.0e-12
+  cross_venue_strength_tolerance: 0.25
 
 scoring:
   exchange_factor_weights:

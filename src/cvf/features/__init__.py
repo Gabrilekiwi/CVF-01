@@ -1,12 +1,29 @@
 """Typed, bounded Phase-3 feature state foundations."""
 
 from cvf.features.availability import FeatureAvailability, evaluate_availability
+from cvf.features.cross_venue import CrossVenueFeatureEngine
 from cvf.features.models import (
+    ActivityAgreement,
+    AlignmentStatus,
+    ContextAgreement,
+    CrossVenueAlignmentResult,
+    CrossVenueConfirmationFeatureValues,
+    CrossVenueFeatureSnapshot,
+    CrossVenueOrderFlowFeatureValues,
+    CrossVenuePositioningFeatureValues,
+    CrossVenuePriceFeatureValues,
+    CrowdingAgreement,
     CrowdingState,
+    DirectionAgreement,
+    DirectionState,
     FeatureSnapshot,
     FeatureUnavailableCode,
     FeatureUnavailableReason,
+    LeadLagResearchFeatureValues,
+    LeadLagStatus,
+    LiquidityDivergenceStatus,
     PriceOpenInterestState,
+    StrengthAgreement,
 )
 from cvf.features.pipeline import FeatureStatePipeline, FeatureStatePipelineStats
 from cvf.features.rolling import (
@@ -27,9 +44,22 @@ from cvf.features.state import (
 )
 
 __all__ = [
+    "ActivityAgreement",
+    "AlignmentStatus",
     "AppendStatus",
     "BoundedTimeWindow",
+    "ContextAgreement",
+    "CrossVenueAlignmentResult",
+    "CrossVenueConfirmationFeatureValues",
+    "CrossVenueFeatureEngine",
+    "CrossVenueFeatureSnapshot",
+    "CrossVenueOrderFlowFeatureValues",
+    "CrossVenuePositioningFeatureValues",
+    "CrossVenuePriceFeatureValues",
+    "CrowdingAgreement",
     "CrowdingState",
+    "DirectionAgreement",
+    "DirectionState",
     "FeatureAvailability",
     "FeatureBookView",
     "FeatureOrderBookState",
@@ -39,11 +69,15 @@ __all__ = [
     "FeatureUnavailableCode",
     "FeatureUnavailableReason",
     "LateEventPolicy",
+    "LeadLagResearchFeatureValues",
+    "LeadLagStatus",
+    "LiquidityDivergenceStatus",
     "MarketStateStore",
     "PriceOpenInterestState",
     "SingleVenueFeatureEngine",
     "StateUpdateResult",
     "StateUpdateStatus",
+    "StrengthAgreement",
     "TimedValue",
     "VenueSymbolState",
     "WindowStats",

@@ -5,12 +5,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from cvf import __version__
 from cvf.config import load_settings
 
 
 def test_default_configuration_loads_and_is_paper_only() -> None:
     settings = load_settings(environ={})
 
+    assert __version__ == "0.2.1"
     assert settings.app.paper_trading_only is True
     assert settings.markets.canonical_symbols == [
         "BTC-USDT-PERP",
@@ -37,4 +39,3 @@ def test_safety_invariants_cannot_be_disabled_by_environment() -> None:
 
     with pytest.raises(ValidationError):
         load_settings(environ={"CVF__RISK__ALLOW_MARTINGALE": "true"})
-
