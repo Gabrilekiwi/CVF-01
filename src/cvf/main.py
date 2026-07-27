@@ -380,6 +380,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Offline flush interval; logical content remains batch-boundary independent",
     )
     phase3_acceptance.add_argument(
+        "--order",
+        type=ReplayOrder,
+        choices=list(ReplayOrder),
+        default=ReplayOrder.RECEIVE_TIME,
+        help="Receive-time matches live decision scheduling for a wall-clock collection",
+    )
+    phase3_acceptance.add_argument(
         "--requested-stability-hours",
         type=float,
         default=6.0,
@@ -531,6 +538,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     first_batch_rows=args.first_batch_rows,
                     second_batch_rows=args.second_batch_rows,
                     writer_flush_seconds=args.writer_flush_seconds,
+                    replay_order=args.order,
                     requested_stability_seconds=(
                         args.requested_stability_hours * 60 * 60
                     ),

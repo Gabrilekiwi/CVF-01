@@ -16,6 +16,7 @@ import pytest
 from cvf.acceptance import run_phase3_acceptance, run_phase3_stability
 from cvf.config import load_settings
 from cvf.models import Exchange
+from cvf.replay import ReplayOrder
 from cvf.storage import AsyncPartitionedParquetWriter, RawMarketRecord
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
@@ -105,6 +106,7 @@ async def test_phase3_acceptance_replays_twice_and_writes_evidence() -> None:
         assert report.first_run.feature_audit.rows == 9
         assert report.first_run.feature_state.accepted_events == 2
         assert report.first_run.writer_flush_seconds == 60
+        assert report.first_run.replay_order is ReplayOrder.RECEIVE_TIME
         assert not report.full_stability_duration_completed
         assert (output / "summary.json").is_file()
         assert (output / "summary.md").is_file()

@@ -105,6 +105,7 @@ class Phase3RunMetrics:
     signal_outputs: int
     order_outputs: int
     private_api_requests: int
+    replay_order: ReplayOrder
     writer_batch_rows: int
     writer_flush_seconds: float
     throughput_records_per_second: float
@@ -404,12 +405,13 @@ async def _run_once(
     output_path: Path,
     batch_rows: int,
     writer_flush_seconds: float,
+    replay_order: ReplayOrder,
     on_replay_complete: Callable[[Phase3RunMetrics], None] | None = None,
 ) -> Phase3RunMetrics:
     if output_path.exists() and any(output_path.iterdir()):
         raise ValueError(f"acceptance output must be empty: {output_path}")
     reader = RawParquetReader(input_path)
-    order = ReplayOrder.EVENT_TIME
+    order = replay_order
     records, first_timestamp = _records_with_first_market_timestamp(
         reader.iter_records(order=order),
         order,
@@ -535,6 +537,7 @@ async def _run_once(
         signal_outputs=0,
         order_outputs=0,
         private_api_requests=0,
+        replay_order=order,
         writer_batch_rows=batch_rows,
         writer_flush_seconds=writer_flush_seconds,
         throughput_records_per_second=throughput,
@@ -608,6 +611,7 @@ async def _load_run_checkpoint(
     expected_output_path: Path,
     expected_batch_rows: int,
     expected_flush_seconds: float,
+    expected_replay_order: ReplayOrder,
 ) -> Phase3RunMetrics:
     checkpoint = _RUN_CHECKPOINT_ADAPTER.validate_json(path.read_bytes())
     if checkpoint.schema_version != 1:
@@ -623,6 +627,7 @@ async def _load_run_checkpoint(
         or metrics.output_path.resolve() != expected_output_path
         or metrics.writer_batch_rows != expected_batch_rows
         or metrics.writer_flush_seconds != expected_flush_seconds
+        or metrics.replay_order is not expected_replay_order
     ):
         raise ValueError(f"Phase 3 checkpoint run parameters do not match: {path}")
     current_audit = await asyncio.to_thread(
@@ -653,6 +658,7 @@ async def _run_or_resume(
     destination: Path,
     batch_rows: int,
     writer_flush_seconds: float,
+    replay_order: ReplayOrder,
     resume: bool,
     package_source_sha256: str,
 ) -> Phase3RunMetrics:
@@ -668,6 +674,7 @@ async def _run_or_resume(
             expected_output_path=output_path.resolve(),
             expected_batch_rows=batch_rows,
             expected_flush_seconds=writer_flush_seconds,
+            expected_replay_order=replay_order,
         )
     if output_path.exists() and any(output_path.iterdir()):
         raise ValueError(
@@ -689,6 +696,7 @@ async def _run_or_resume(
         output_path=output_path,
         batch_rows=batch_rows,
         writer_flush_seconds=writer_flush_seconds,
+        replay_order=replay_order,
         on_replay_complete=save_replay_checkpoint,
     )
     _write_run_checkpoint(
@@ -718,6 +726,7 @@ def _render_markdown(report: Phase3AcceptanceReport) -> str:
         "",
         f"- Generated: `{report.generated_at.astimezone(UTC).isoformat()}`",
         f"- Fixed input: `{report.input_path}`",
+        f"- Replay order: `{first.replay_order.value}`",
         (
             f"- Raw audit: {report.raw_audit.rows:,} rows, "
             f"{report.raw_audit.files:,} files, "
@@ -836,6 +845,7 @@ async def run_phase3_acceptance(
     first_batch_rows: int = 1_000,
     second_batch_rows: int = 777,
     writer_flush_seconds: float = 60,
+    replay_order: ReplayOrder = ReplayOrder.RECEIVE_TIME,
     requested_stability_seconds: float = 6 * 60 * 60,
     resume: bool = False,
 ) -> Phase3AcceptanceReport:
@@ -866,6 +876,7 @@ async def run_phase3_acceptance(
         destination=destination,
         batch_rows=first_batch_rows,
         writer_flush_seconds=writer_flush_seconds,
+        replay_order=replay_order,
         resume=resume,
         package_source_sha256=package_source_sha256,
     )
@@ -876,6 +887,7 @@ async def run_phase3_acceptance(
         destination=destination,
         batch_rows=second_batch_rows,
         writer_flush_seconds=writer_flush_seconds,
+        replay_order=replay_order,
         resume=resume,
         package_source_sha256=package_source_sha256,
     )
