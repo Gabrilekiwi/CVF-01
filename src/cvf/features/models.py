@@ -501,7 +501,7 @@ class CrossVenueFeatureSnapshot(EventBase):
     source_event_count: int = Field(ge=0)
     oldest_source_timestamp: datetime | None = None
     newest_source_timestamp: datetime | None = None
-    data_age_ms: float = Field(ge=0)
+    data_age_ms: float | None = Field(default=None, ge=0)
     is_warm: bool
     is_healthy: bool
     alignment: CrossVenueAlignmentResult
@@ -531,10 +531,8 @@ class CrossVenueFeatureSnapshot(EventBase):
 
     @field_validator("data_age_ms")
     @classmethod
-    def finite_data_age(cls, value: float) -> float:
-        result = _finite(value)
-        assert result is not None
-        return float(result)
+    def finite_data_age(cls, value: float | None) -> float | None:
+        return _finite(value)
 
     @model_validator(mode="after")
     def validate_cross_venue_boundaries(self) -> CrossVenueFeatureSnapshot:

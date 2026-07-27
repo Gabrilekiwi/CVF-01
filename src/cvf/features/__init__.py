@@ -1,6 +1,7 @@
 """Typed, bounded Phase-3 feature state foundations."""
 
 from cvf.features.availability import FeatureAvailability, evaluate_availability
+from cvf.features.cross_venue import CrossVenueFeatureEngine
 from cvf.features.models import (
     ActivityAgreement,
     AlignmentStatus,
@@ -50,6 +51,7 @@ __all__ = [
     "ContextAgreement",
     "CrossVenueAlignmentResult",
     "CrossVenueConfirmationFeatureValues",
+    "CrossVenueFeatureEngine",
     "CrossVenueFeatureSnapshot",
     "CrossVenueOrderFlowFeatureValues",
     "CrossVenuePositioningFeatureValues",
