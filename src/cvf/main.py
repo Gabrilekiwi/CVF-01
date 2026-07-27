@@ -24,6 +24,11 @@ from cvf.logging_config import configure_logging
 from cvf.models.enums import Exchange
 from cvf.replay import RawParquetReader, RawScanFilter, ReplayOrder, ReplayRunner
 from cvf.storage.compact import compact_raw_tree
+from cvf.storage.features import (
+    FeatureScanFilter,
+    audit_feature_tree,
+    compare_feature_trees,
+)
 
 
 def build_connectors(settings: Settings) -> list[ExchangeConnector]:
@@ -314,6 +319,32 @@ def _parser() -> argparse.ArgumentParser:
     compact.add_argument("--input", type=Path, required=True)
     compact.add_argument("--output", type=Path, required=True)
     compact.add_argument("--target-rows", type=int, default=100_000)
+    audit_features = subparsers.add_parser(
+        "audit-features",
+        help="Audit versioned feature Parquet schema, lineage, and partitions",
+    )
+    audit_features.add_argument("--config", type=Path)
+    audit_features.add_argument("--input", type=Path, required=True)
+    audit_features.add_argument("--start", type=_parse_timestamp)
+    audit_features.add_argument("--end", type=_parse_timestamp)
+    audit_features.add_argument(
+        "--scope",
+        action="append",
+        choices=[
+            Exchange.BINANCE.value,
+            Exchange.OKX.value,
+            Exchange.CROSS_VENUE.value,
+        ],
+    )
+    audit_features.add_argument("--symbol", action="append")
+    audit_features.add_argument("--window", action="append", type=int)
+    compare_features = subparsers.add_parser(
+        "compare-features",
+        help="Require two feature trees to have identical logical content",
+    )
+    compare_features.add_argument("--config", type=Path)
+    compare_features.add_argument("--left", type=Path, required=True)
+    compare_features.add_argument("--right", type=Path, required=True)
     return parser
 
 
@@ -352,7 +383,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
         if args.command == "compact-raw":
-            report = compact_raw_tree(
+            compaction_report = compact_raw_tree(
                 args.input,
                 args.output,
                 target_rows=args.target_rows,
@@ -361,12 +392,54 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "raw compaction complete",
                 extra={
                     "event": "raw_compaction_complete",
-                    "input_path": str(report.input_path),
-                    "output_path": str(report.output_path),
-                    "before": asdict(report.before),
-                    "after": asdict(report.after),
+                    "input_path": str(compaction_report.input_path),
+                    "output_path": str(compaction_report.output_path),
+                    "before": asdict(compaction_report.before),
+                    "after": asdict(compaction_report.after),
                 },
             )
+            return 0
+        if args.command == "audit-features":
+            feature_filter = FeatureScanFilter(
+                start=args.start,
+                end=args.end,
+                scopes=(
+                    None
+                    if not args.scope
+                    else frozenset(Exchange(value) for value in args.scope)
+                ),
+                symbols=(
+                    None if not args.symbol else frozenset(args.symbol)
+                ),
+                windows=(
+                    None if not args.window else frozenset(args.window)
+                ),
+            )
+            audit = audit_feature_tree(args.input, filters=feature_filter)
+            logging.getLogger("cvf").info(
+                "feature audit complete",
+                extra={
+                    "event": "feature_audit_complete",
+                    "input_path": str(args.input.resolve()),
+                    "audit": asdict(audit),
+                },
+            )
+            return 0
+        if args.command == "compare-features":
+            feature_report = compare_feature_trees(args.left, args.right)
+            logging.getLogger("cvf").info(
+                "feature consistency comparison complete",
+                extra={
+                    "event": "feature_consistency_complete",
+                    "left_path": str(feature_report.left_path),
+                    "right_path": str(feature_report.right_path),
+                    "identical": feature_report.identical,
+                    "left": asdict(feature_report.left),
+                    "right": asdict(feature_report.right),
+                },
+            )
+            if not feature_report.identical:
+                raise RuntimeError("feature tree consistency mismatch")
             return 0
         return asyncio.run(run(settings, once=args.once))
     except (OSError, RuntimeError, ValueError) as exc:
