@@ -292,6 +292,7 @@ def test_age_and_time_difference_equal_to_threshold_are_accepted() -> None:
 
     assert result.alignment.status is AlignmentStatus.ALIGNED
     assert result.alignment.binance_data_age_ms == pytest.approx(2_000)
+    assert result.alignment.data_age_difference_ms == pytest.approx(500)
     assert result.alignment.snapshot_time_difference_ms == pytest.approx(500)
 
 

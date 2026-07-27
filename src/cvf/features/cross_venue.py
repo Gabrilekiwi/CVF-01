@@ -437,6 +437,11 @@ class CrossVenueFeatureEngine:
             if binance_source is None or okx_source is None
             else abs((binance_source - okx_source).total_seconds() * 1000.0)
         )
+        data_age_difference = (
+            None
+            if binance_age is None or okx_age is None
+            else abs(binance_age - okx_age)
+        )
         if binance is None or okx is None:
             status = AlignmentStatus.UNAVAILABLE
         else:
@@ -561,6 +566,7 @@ class CrossVenueFeatureEngine:
             okx_source_timestamp=okx_source,
             binance_data_age_ms=binance_age,
             okx_data_age_ms=okx_age,
+            data_age_difference_ms=data_age_difference,
             snapshot_time_difference_ms=time_difference,
             status=status,
             quality=quality,

@@ -260,6 +260,7 @@ class CrossVenueAlignmentResult(FrozenModel):
     okx_source_timestamp: datetime | None = None
     binance_data_age_ms: float | None = Field(default=None, ge=0)
     okx_data_age_ms: float | None = Field(default=None, ge=0)
+    data_age_difference_ms: float | None = Field(default=None, ge=0)
     snapshot_time_difference_ms: float | None = Field(default=None, ge=0)
     status: AlignmentStatus
     quality: float = Field(ge=0, le=1)
@@ -281,6 +282,7 @@ class CrossVenueAlignmentResult(FrozenModel):
     @field_validator(
         "binance_data_age_ms",
         "okx_data_age_ms",
+        "data_age_difference_ms",
         "snapshot_time_difference_ms",
         "quality",
     )
