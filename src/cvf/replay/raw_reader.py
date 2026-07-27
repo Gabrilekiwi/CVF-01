@@ -81,21 +81,32 @@ class RawParquetReader:
         parquet_file = pq.ParquetFile(path)
         if parquet_file.schema_arrow != RAW_PARQUET_SCHEMA:
             raise ValueError(f"raw Parquet schema mismatch: {path}")
-        previous_key: tuple[object, ...] | None = None
-        for batch in parquet_file.iter_batches(batch_size=self.batch_size):
+
+        def row_group_records(index: int) -> Iterator[RawMarketRecord]:
+            records: list[RawMarketRecord] = []
+            for batch in parquet_file.iter_batches(
+                batch_size=self.batch_size,
+                row_groups=[index],
+            ):
+                records.extend(
+                    _record_from_row(row)
+                    for row in batch.to_pylist()
+                    if int(str(row["schema_version"])) == 1
+                )
             records = [
-                _record_from_row(row)
-                for row in batch.to_pylist()
-                if int(str(row["schema_version"])) == 1
+                record for record in records if self._matches(record, filters)
             ]
-            records = [record for record in records if self._matches(record, filters)]
             records.sort(key=lambda record: stable_record_key(record, order))
-            for record in records:
-                key = stable_record_key(record, order)
-                if previous_key is not None and key < previous_key:
-                    raise ValueError(f"raw Parquet file is not monotonically ordered: {path}")
-                previous_key = key
-                yield record
+            yield from records
+
+        row_groups = (
+            row_group_records(index)
+            for index in range(parquet_file.num_row_groups)
+        )
+        yield from heapq.merge(
+            *row_groups,
+            key=lambda record: stable_record_key(record, order),
+        )
 
     def iter_records(
         self,

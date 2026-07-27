@@ -148,6 +148,32 @@ async def test_reader_replays_live_normalization_equivalently() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reader_orders_one_physically_unsorted_file_across_read_batches() -> None:
+    with scratch_directory() as temporary:
+        raw = temporary / "raw"
+        writer = AsyncPartitionedParquetWriter(
+            root_path=raw,
+            batch_rows=5,
+            flush_seconds=60,
+            queue_capacity=10,
+        )
+        await writer.start()
+        for sequence in (5, 1, 4, 2, 3):
+            await writer.write(agg_trade(sequence, sequence))
+        await writer.close()
+
+        records = list(RawParquetReader(raw, batch_size=2).iter_records())
+
+        assert [record.sequence_id for record in records] == [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
     with scratch_directory() as temporary:
         raw = temporary / "raw"
