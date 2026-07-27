@@ -240,7 +240,16 @@ async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
 
 @pytest.mark.asyncio
 async def test_replay_ticks_include_all_events_at_the_decision_boundary() -> None:
-    bus = NormalizedEventBus(default_queue_capacity=2)
+    class CountingEventBus(NormalizedEventBus):
+        def __init__(self) -> None:
+            super().__init__(default_queue_capacity=2)
+            self.drain_calls = 0
+
+        async def drain(self) -> None:
+            self.drain_calls += 1
+            await super().drain()
+
+    bus = CountingEventBus()
     feature_state = FeatureStatePipeline(
         MarketStateStore(load_settings(environ={}).features)
     )
@@ -263,12 +272,19 @@ async def test_replay_ticks_include_all_events_at_the_decision_boundary() -> Non
         scheduler=scheduler,
         tick_sink=capture_tick,
         speed=0,
-    ).run([agg_trade(1, 1_000), agg_trade(2, 2_000)])
+    ).run(
+        [
+            agg_trade(1, 1_000),
+            agg_trade(2, 1_500),
+            agg_trade(3, 2_000),
+        ]
+    )
 
     assert observed_trade_counts == [
         (NOW + timedelta(seconds=1), 1),
-        (NOW + timedelta(seconds=2), 2),
+        (NOW + timedelta(seconds=2), 3),
     ]
+    assert bus.drain_calls == 2
 
 
 @pytest.mark.asyncio

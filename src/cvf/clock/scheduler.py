@@ -55,6 +55,14 @@ class DecisionScheduler:
     def cursor(self) -> datetime:
         return self._cursor
 
+    def has_due_tick(self, target: datetime) -> bool:
+        """Return whether advancing to target would emit a decision tick."""
+
+        end = _utc(target)
+        if end < self._cursor:
+            raise ValueError("decision scheduler cannot move backwards")
+        return min(self._next_feature, self._next_signal) <= end
+
     def advance_to(self, target: datetime) -> list[DecisionTick]:
         """Return every due tick in stable timestamp/feature-before-signal order."""
 
