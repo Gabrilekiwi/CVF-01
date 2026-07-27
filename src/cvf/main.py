@@ -364,6 +364,35 @@ def _parser() -> argparse.ArgumentParser:
     compare_features.add_argument("--config", type=Path)
     compare_features.add_argument("--left", type=Path, required=True)
     compare_features.add_argument("--right", type=Path, required=True)
+    phase3_acceptance = subparsers.add_parser(
+        "accept-phase3",
+        help="Replay a fixed public dataset twice and write Phase 3 evidence",
+    )
+    phase3_acceptance.add_argument("--config", type=Path)
+    phase3_acceptance.add_argument("--input", type=Path, required=True)
+    phase3_acceptance.add_argument("--output", type=Path, required=True)
+    phase3_acceptance.add_argument("--first-batch-rows", type=int, default=1_000)
+    phase3_acceptance.add_argument("--second-batch-rows", type=int, default=777)
+    phase3_acceptance.add_argument(
+        "--requested-stability-hours",
+        type=float,
+        default=6.0,
+        help="Acceptance target recorded honestly against actual observed wall time",
+    )
+    phase3_stability = subparsers.add_parser(
+        "stability-phase3",
+        help="Repeat fixed-data acceptance toward a six-hour wall-clock target",
+    )
+    phase3_stability.add_argument("--config", type=Path)
+    phase3_stability.add_argument("--input", type=Path, required=True)
+    phase3_stability.add_argument("--output", type=Path, required=True)
+    phase3_stability.add_argument("--target-hours", type=float, default=6.0)
+    phase3_stability.add_argument("--maximum-iterations", type=int)
+    phase3_stability.add_argument(
+        "--retain-feature-trees",
+        action="store_true",
+        help="Retain audited per-run Parquet trees instead of summaries only",
+    )
     return parser
 
 
@@ -479,6 +508,64 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if not feature_report.identical:
                 raise RuntimeError("feature tree consistency mismatch")
+            return 0
+        if args.command == "accept-phase3":
+            from cvf.acceptance import run_phase3_acceptance
+
+            acceptance_report = asyncio.run(
+                run_phase3_acceptance(
+                    settings,
+                    input_path=args.input,
+                    output_path=args.output,
+                    first_batch_rows=args.first_batch_rows,
+                    second_batch_rows=args.second_batch_rows,
+                    requested_stability_seconds=(
+                        args.requested_stability_hours * 60 * 60
+                    ),
+                )
+            )
+            logging.getLogger("cvf").info(
+                "Phase 3 fixed-dataset acceptance complete",
+                extra={
+                    "event": "phase3_acceptance_complete",
+                    "input_path": str(acceptance_report.input_path),
+                    "output_path": str(acceptance_report.output_path),
+                    "deterministic_replay": acceptance_report.deterministic_replay,
+                    "no_lookahead": acceptance_report.no_lookahead,
+                    "throughput_above_realtime": (
+                        acceptance_report.throughput_above_realtime
+                    ),
+                    "full_stability_duration_completed": (
+                        acceptance_report.full_stability_duration_completed
+                    ),
+                },
+            )
+            return 0
+        if args.command == "stability-phase3":
+            from cvf.acceptance import run_phase3_stability
+
+            stability_report = asyncio.run(
+                run_phase3_stability(
+                    settings,
+                    input_path=args.input,
+                    output_path=args.output,
+                    target_seconds=args.target_hours * 60 * 60,
+                    maximum_iterations=args.maximum_iterations,
+                    retain_feature_trees=args.retain_feature_trees,
+                )
+            )
+            logging.getLogger("cvf").info(
+                "Phase 3 stability run complete",
+                extra={
+                    "event": "phase3_stability_complete",
+                    "input_path": str(stability_report.input_path),
+                    "output_path": str(stability_report.output_path),
+                    "target_seconds": stability_report.target_seconds,
+                    "actual_wall_seconds": stability_report.actual_wall_seconds,
+                    "target_completed": stability_report.target_completed,
+                    "iterations": len(stability_report.iterations),
+                },
+            )
             return 0
         return asyncio.run(run(settings, once=args.once))
     except (OSError, RuntimeError, ValueError) as exc:
