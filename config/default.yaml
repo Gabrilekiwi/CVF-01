@@ -207,6 +207,10 @@ storage:
   parquet_batch_rows: 10000
   parquet_flush_seconds: 5
   parquet_queue_capacity: 50000
+  feature_parquet_batch_rows: 10000
+  feature_parquet_flush_seconds: 5
+  feature_parquet_queue_capacity: 50000
+  feature_deduplication_capacity: 500000
   database_batch_rows: 500
   database_flush_seconds: 1
 
