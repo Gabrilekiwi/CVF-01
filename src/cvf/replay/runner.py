@@ -6,7 +6,7 @@ import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from cvf.clock.replay import ReplayClock
 from cvf.clock.scheduler import DecisionScheduler, DecisionTick
@@ -62,6 +62,17 @@ class ReplayRunner:
         finished_at: datetime | None = None
         clock: ReplayClock | None = None
         previous_timestamp: datetime | None = None
+
+        async def emit_ticks(target: datetime) -> None:
+            if self._scheduler is None:
+                return
+            if not self._scheduler.has_due_tick(target):
+                return
+            await self._event_bus.drain()
+            for tick in self._scheduler.advance_to(target):
+                if self._tick_sink is not None:
+                    await self._tick_sink(tick)
+
         try:
             for record in records:
                 if record.channel == "instrument_metadata":
@@ -77,20 +88,20 @@ class ReplayRunner:
                 if clock is None:
                     clock = ReplayClock(timestamp)
                     started_at = timestamp
-                elif self._speed > 0 and previous_timestamp is not None:
-                    delay = (timestamp - previous_timestamp).total_seconds() / self._speed
-                    if delay > 0:
-                        await asyncio.sleep(delay)
+                elif previous_timestamp is not None and timestamp > previous_timestamp:
+                    await emit_ticks(timestamp - timedelta(microseconds=1))
+                    if self._speed > 0:
+                        delay = (
+                            timestamp - previous_timestamp
+                        ).total_seconds() / self._speed
+                        if delay > 0:
+                            await asyncio.sleep(delay)
                 clock.advance_to(timestamp)
                 previous_timestamp = timestamp
                 finished_at = timestamp
                 raw_count += 1
                 generation_key = f"{record.exchange.value}:{record.channel}:{record.symbol}"
                 generations[generation_key] = record.connection_generation
-                if self._scheduler is not None:
-                    for tick in self._scheduler.advance_to(timestamp):
-                        if self._tick_sink is not None:
-                            await self._tick_sink(tick)
                 events = self._normalizer.normalize(record)
                 if not events:
                     skipped_count += 1
@@ -98,6 +109,8 @@ class ReplayRunner:
                     await self._event_bus.publish(event)
                     normalized_count += 1
                     event_counts[event.event_type.value] += 1
+            if previous_timestamp is not None:
+                await emit_ticks(previous_timestamp)
         finally:
             await self._event_bus.close()
         return ReplaySummary(

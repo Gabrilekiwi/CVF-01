@@ -8,6 +8,7 @@ from datetime import UTC
 from cvf.models.enums import Exchange
 from cvf.normalization.binance import BinanceNormalizer
 from cvf.normalization.common import NormalizationContext, NormalizedMarketEvent
+from cvf.normalization.instruments import ContractSpecification
 from cvf.normalization.okx import (
     OkxNormalizer,
     contract_specifications_from_response,
@@ -25,7 +26,8 @@ class RawRecordNormalizer:
 
     def __init__(self) -> None:
         self._binance = BinanceNormalizer()
-        self._okx = OkxNormalizer({})
+        self._okx_specifications: dict[str, ContractSpecification] = {}
+        self._okx = OkxNormalizer(self._okx_specifications)
 
     def normalize(self, record: RawMarketRecord) -> list[NormalizedMarketEvent]:
         if (
@@ -49,7 +51,21 @@ class RawRecordNormalizer:
         if record.exchange is Exchange.OKX:
             if record.channel == "instrument_metadata":
                 specifications = contract_specifications_from_response(payload)
-                self._okx = OkxNormalizer(specifications)
+                self._okx_specifications.update(specifications)
+                self._okx = OkxNormalizer(self._okx_specifications)
                 return []
+            if record.channel == "liquidation-orders" and isinstance(payload, dict):
+                data = payload.get("data")
+                if isinstance(data, list):
+                    configured_data = [
+                        item
+                        for item in data
+                        if isinstance(item, dict)
+                        and isinstance(item.get("instId"), str)
+                        and item["instId"].upper() in self._okx_specifications
+                    ]
+                    if not configured_data:
+                        return []
+                    payload = {**payload, "data": configured_data}
             return self._okx.normalize(payload, context=context)
         return []

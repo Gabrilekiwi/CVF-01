@@ -19,6 +19,7 @@ from cvf.storage.features import (
     PersistableFeatureSnapshot,
     PersistedFeatureRecord,
     audit_feature_tree,
+    compare_feature_audits,
     compare_feature_trees,
 )
 from cvf.storage.parquet import (
@@ -51,5 +52,6 @@ __all__ = [
     "audit_feature_tree",
     "audit_raw_tree",
     "compact_raw_tree",
+    "compare_feature_audits",
     "compare_feature_trees",
 ]

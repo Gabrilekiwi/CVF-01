@@ -1,7 +1,7 @@
 app:
   name: "CVF-01"
   environment: "development"
-  strategy_version: "0.1.0"
+  strategy_version: "0.3.0"
   status_interval_seconds: 5
   shutdown_timeout_seconds: 10
   paper_trading_only: true

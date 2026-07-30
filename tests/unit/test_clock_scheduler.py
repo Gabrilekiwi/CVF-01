@@ -53,3 +53,16 @@ def test_scheduler_rejects_time_travel() -> None:
     )
     with pytest.raises(ValueError, match="backwards"):
         scheduler.advance_to(START - timedelta(microseconds=1))
+
+
+def test_scheduler_reports_due_ticks_without_advancing_state() -> None:
+    scheduler = DecisionScheduler(
+        start=START,
+        feature_interval=timedelta(seconds=1),
+        signal_interval=timedelta(seconds=5),
+    )
+    boundary = datetime(2026, 7, 24, 12, 0, 1, tzinfo=UTC)
+
+    assert not scheduler.has_due_tick(boundary - timedelta(microseconds=1))
+    assert scheduler.has_due_tick(boundary)
+    assert scheduler.cursor == START

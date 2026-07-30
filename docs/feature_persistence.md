@@ -47,11 +47,13 @@ stats and raised to producers/close.
 6. monotonic order inside each file and deterministic merged order;
 7. uniqueness of feature UUIDs across the selected tree.
 
-Filters cover inclusive decision time, scope, symbol, window, warmup, and health.
+Filters cover inclusive decision time, scope, symbol, window, schema version, snapshot ID,
+structured unavailable reason, warmup, and health.
 
 `audit_feature_tree` returns row/file/partition/unique-ID counts, an order-independent content
-digest, scope/code/config sets, and decision bounds. `compare_feature_trees` requires logical
-equality while allowing different file and batch boundaries.
+digest, scope/code/config sets, decision bounds, and structured unavailable-reason counts.
+`compare_feature_trees` requires logical equality while allowing different file and batch
+boundaries.
 
 Float comparison is exact at the canonical payload layer. No hidden tolerance can convert a
 small difference into equality.
@@ -66,10 +68,17 @@ python -m cvf compare-features --left data/live_features --right data/replay_fea
 Both commands are network-free. They use no API keys, accounts, private endpoints, signals, or
 orders.
 
+The Phase 3 acceptance runner also records accepted/deduplicated snapshots, queue
+backpressure, flush/file counts, last/average/maximum write latency, and retained worker error.
+Atomic checkpoints separate replay completion from successful audit; `--resume` verifies
+package/settings/input identity and re-audits any retained tree before comparison.
+
 ## Verification evidence
 
-The Phase 3D suite has 34 focused tests for layout, round trips, source lineage, deduplication,
-bounded caches/queues, flush/close, backpressure, atomic files, stable order, all filters,
+The Phase 3D-focused suite covers layout, round trips, source lineage, deduplication, bounded
+caches/queues, flush/close, backpressure, atomic files, stable order, all filters,
 schema/hash/metadata/partition tampering, duplicate IDs, audit summaries, exact float handling,
 independent live/replay engine generation, logical-tree comparison, version/config rejection,
-CLI behavior, and the no-signal/order boundary.
+CLI behavior, and the no-signal/order boundary. Integration coverage additionally exercises
+deterministic two-run acceptance, checkpoint reuse/rejection, stability summary generation,
+strict no-lookahead, and zero signal/order/private-API counters.

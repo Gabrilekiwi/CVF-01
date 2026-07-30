@@ -63,6 +63,18 @@ history method that is robust to clock offsets and asynchronous transport.
 
 The implementation uses no credentials, private endpoints, accounts, positions, or order APIs.
 
+## Fixed-data acceptance limitation
+
+The retained 30-minute public dataset emits 10,836 deterministic cross-venue snapshots per
+replay, but none is fully warm and aligned. The configured history is 1,800 seconds while the
+usable decision span is only about 1,805 seconds, and some required histories begin later;
+stale OI, sparse late trades, and source-time alignment also block availability. Both
+independent replays produce the same structured unavailable output and exact logical tree.
+
+This result validates deterministic selection, unavailable reasoning, persistence, and
+no-lookahead on the retained data. Warm/aligned formulas are covered by dedicated reference
+tests; sustained warm/aligned behavior still requires a longer live capture.
+
 ## Verification
 
 The dedicated suite contains 31 tests, including formula checks, threshold equality/overrun,

@@ -1,9 +1,10 @@
 # Cross-Venue Short-Term Flow Strategy (CVF-01)
 
 CVF-01 is a research-first, paper-trading-only system for short-horizon Binance and OKX
-USDT perpetual signals. Phase 3D adds audited, versioned Parquet persistence for the deterministic
-single-venue and cross-venue snapshots shared by live processing and replay. It still does not
-score markets, generate signals, or place orders.
+USDT perpetual research. Version 0.3.0 completes the Phase 3 feature pipeline: deterministic
+single-venue and cross-venue snapshots, audited Parquet persistence, fixed-data replay
+acceptance, resumable checkpoints, and a repeatable stability harness. It still does not score
+markets, generate signals, or place orders.
 
 ## Current status
 
@@ -78,6 +79,15 @@ Phase 3D additionally includes:
 - strict deterministic readers with time/scope/symbol/window/health filters;
 - schema, payload, partition, duplicate-ID, content-digest, and live/replay tree audits;
 - `cvf audit-features` and `cvf compare-features` offline verification commands.
+
+Phase 3 acceptance additionally includes:
+
+- two independent fixed-data replays with different writer batch boundaries;
+- exact logical-tree equality, schema/lineage audits, and immediate no-lookahead failure;
+- observed throughput, CPU, RSS, calculation/receive/write latency, state outcomes, and safety
+  counters;
+- source/settings/package-bound atomic checkpoints and `--resume`;
+- JSON plus Markdown evidence, and a repeatable six-hour stability command.
 
 Scoring, signals, paper trading, private APIs, and real orders remain unimplemented.
 
@@ -192,6 +202,34 @@ python -m cvf compare-features `
 Comparison is exact at the canonical payload/hash layer and allows only physical Parquet batch
 and file-boundary differences.
 
+## Phase 3 acceptance
+
+Run the fixed wall-clock collection twice, using receive-time ordering to reproduce live
+decision scheduling:
+
+```powershell
+cvf accept-phase3 `
+  --input data/processed/phase3-acceptance/raw-compacted `
+  --output data/processed/phase3-acceptance/fixed-30m-v0.3.0 `
+  --order receive-time
+```
+
+Add `--resume` only to reuse package/settings/input-matched checkpoints; reused feature trees
+are audited again. Run the repeatable stability harness with:
+
+```powershell
+cvf stability-phase3 `
+  --input data/processed/phase3-acceptance/raw-compacted `
+  --output data/processed/phase3-acceptance/stability-v0.3.0 `
+  --target-hours 6
+```
+
+`--maximum-iterations 1` is useful for a bounded harness check, but does not satisfy the
+six-hour criterion. The longest retained fixed-data acceptance passed determinism,
+no-lookahead, throughput, schema/lineage, and safety checks; a true six-hour continuous
+live/reconnect observation remains pending. See
+[Phase 3 acceptance evidence](docs/phase3_acceptance.md).
+
 ## Configuration
 
 `config/default.yaml` is merged with an optional overlay and then `CVF__...` environment
@@ -212,7 +250,7 @@ latency thresholds, dedupe TTL/capacity, Parquet batch/flush/queue sizes, and ou
 ```powershell
 python -m pytest -q
 python -m ruff check .
-python -m mypy src/cvf
+python -m mypy --strict src/cvf
 python -m pip check
 ```
 
@@ -231,6 +269,7 @@ src/cvf/
   orderbook/             exact venue-specific local books
   monitoring/            per-stream health accounting
   storage/               bounded raw/feature Parquet writers and audits
+  acceptance/            fixed-data acceptance, checkpoints, and stability evidence
   pipeline/              bounded ordered normalized-event fan-out
   clock/                 live/replay clock and deterministic scheduler
   replay/                raw scanning, ordering, normalization, replay runner
@@ -238,7 +277,9 @@ src/cvf/
   features/              bounded state, availability, typed snapshots, venue features
   strategy/              Phase-4+ boundary; not active
 tests/                   unit/integration tests and versioned payload fixtures
+scripts/                 raw validators and Phase 3 stability entry point
 data/raw/                ignored runtime collection output
+data/processed/          ignored feature/acceptance output
 ```
 
 ## Documentation
@@ -247,6 +288,7 @@ data/raw/                ignored runtime collection output
 - [Cross-venue feature contract](docs/cross_venue_features.md)
 - [Data dictionary](docs/data_dictionary.md)
 - [Feature persistence and audit](docs/feature_persistence.md)
+- [Phase 3 acceptance evidence](docs/phase3_acceptance.md)
 - [Operations](docs/operations.md)
 - [Strategy specification](docs/strategy.md)
 
@@ -270,7 +312,9 @@ and [OKX API v5 documentation](https://www.okx.com/docs-v5/en/). See
    confirmation/divergence observations, and research-only lead/lag schema.
 6. **Phase 3D (implemented):** versioned feature Parquet, bounded atomic writer, strict reader,
    lineage audit, and exact live/replay logical-tree comparison.
-7. **Phase 4:** scores and entry/exit/hold/no-trade signals.
-8. **Phase 5:** order-book-based paper fills and risk controls.
-9. **Phase 6:** backtests, evaluation, and parameter sensitivity.
-10. **Phase 7:** a small monitoring dashboard.
+7. **Phase 3 acceptance (fixed-data passed; six-hour live observation pending):** repeatable
+   deterministic replay, no-lookahead, performance/resource evidence, checkpoints, and reports.
+8. **Phase 4:** scores and entry/exit/hold/no-trade signals.
+9. **Phase 5:** order-book-based paper fills and risk controls.
+10. **Phase 6:** backtests, evaluation, and parameter sensitivity.
+11. **Phase 7:** a small monitoring dashboard.

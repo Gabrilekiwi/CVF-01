@@ -62,28 +62,6 @@ def _reference_price(event: Trade | BestBidAsk | MarkPrice) -> Decimal:
     return event.mark_price
 
 
-def _latest_at_or_before[T](
-    values: Iterable[TimedValue[T]],
-    decision: datetime,
-) -> TimedValue[T] | None:
-    for item in reversed(list(values)):
-        if item.timestamp <= decision:
-            return item
-    return None
-
-
-def _at_or_before[T](
-    values: Iterable[TimedValue[T]],
-    boundary: datetime,
-) -> TimedValue[T] | None:
-    candidate: TimedValue[T] | None = None
-    for item in values:
-        if item.timestamp > boundary:
-            break
-        candidate = item
-    return candidate
-
-
 class _MetricHistory:
     def __init__(self, settings: Settings) -> None:
         retention = timedelta(seconds=settings.features.zscore_lookback_seconds)
@@ -213,16 +191,8 @@ class SingleVenueFeatureEngine:
             ).reasons
         )
 
-        trades = [
-            item
-            for item in state.trades
-            if start < item.timestamp <= decision
-        ]
-        previous_trades = [
-            item
-            for item in state.trades
-            if start - window < item.timestamp <= start
-        ]
+        trades = state.trades.items_between(start, decision)
+        previous_trades = state.trades.items_between(start - window, start)
         if not trades and not any(
             reason.code is FeatureUnavailableCode.NO_TRADES for reason in reasons
         ):
@@ -287,8 +257,10 @@ class SingleVenueFeatureEngine:
             ),
         )
 
-        book_items = list(state.book_updates)
-        has_future_book = bool(book_items and book_items[-1].timestamp > decision)
+        latest_book = state.book_updates.latest
+        has_future_book = bool(
+            latest_book is not None and latest_book.timestamp > decision
+        )
         book_view = state.order_book.view(depth=self.settings.features.order_book_depth)
         order_book = None if has_future_book else self._order_book_values(
             state,
@@ -488,11 +460,8 @@ class SingleVenueFeatureEngine:
             )
             / top_quantity
         )
-        changes = [
-            item.value
-            for item in state.book_changes
-            if start < item.timestamp <= decision
-        ]
+        change_items = state.book_changes.items_between(start, decision)
+        changes = [item.value for item in change_items]
         ofi = sum(
             (change.order_flow_imbalance for change in changes),
             Decimal(0),
@@ -522,9 +491,8 @@ class SingleVenueFeatureEngine:
         first_removal_at = next(
             (
                 item.timestamp
-                for item in state.book_changes
-                if start < item.timestamp <= decision
-                and (
+                for item in change_items
+                if (
                     item.value.removed_bid_quantity
                     + item.value.removed_ask_quantity
                     > 0
@@ -539,7 +507,7 @@ class SingleVenueFeatureEngine:
                 (
                     item.value.added_bid_quantity
                     + item.value.added_ask_quantity
-                    for item in state.book_changes
+                    for item in change_items
                     if first_removal_at < item.timestamp <= decision
                 ),
                 Decimal(0),
@@ -586,11 +554,7 @@ class SingleVenueFeatureEngine:
         decision: datetime,
         history_prefix: str,
     ) -> tuple[PriceFeatureValues, float | None, bool]:
-        prices = [
-            item
-            for item in state.prices
-            if start < item.timestamp <= decision
-        ]
+        prices = state.prices.items_between(start, decision)
         first = None if not prices else _reference_price(prices[0].value)
         last = None if not prices else _reference_price(prices[-1].value)
         return_value = (
@@ -609,21 +573,18 @@ class SingleVenueFeatureEngine:
             right_price = _reference_price(right.value)
             if left_price > 0 and right_price > 0:
                 log_returns.append(math.log(float(right_price / left_price)))
-        atr_prices = [
-            item
-            for item in state.prices
-            if decision - timedelta(seconds=self.settings.features.atr_period_seconds)
-            < item.timestamp
-            <= decision
-        ]
+        atr_prices = state.prices.items_between(
+            decision - timedelta(seconds=self.settings.features.atr_period_seconds),
+            decision,
+        )
         atr = _one_second_atr(atr_prices)
         breakout_prices = [
             _reference_price(item.value)
-            for item in state.prices
-            if decision
-            - timedelta(seconds=self.settings.features.breakout_lookback_seconds)
-            < item.timestamp
-            <= decision
+            for item in state.prices.items_between(
+                decision
+                - timedelta(seconds=self.settings.features.breakout_lookback_seconds),
+                decision,
+            )
         ]
         return (
             PriceFeatureValues(
@@ -665,8 +626,8 @@ class SingleVenueFeatureEngine:
         decision: datetime,
         history_prefix: str,
     ) -> tuple[OpenInterestFeatureValues | None, float | None, bool]:
-        latest = _latest_at_or_before(state.open_interest, decision)
-        anchor = _at_or_before(state.open_interest, start)
+        latest = state.open_interest.latest_at_or_before(decision)
+        anchor = state.open_interest.latest_at_or_before(start)
         if latest is None:
             return None, None, False
 
@@ -709,9 +670,9 @@ class SingleVenueFeatureEngine:
         price_return: float | None,
         oi_change: float | None,
     ) -> tuple[CrowdingFeatureValues, bool]:
-        funding = _latest_at_or_before(state.funding_rates, decision)
-        mark = _latest_at_or_before(state.mark_prices, decision)
-        index = _latest_at_or_before(state.index_prices, decision)
+        funding = state.funding_rates.latest_at_or_before(decision)
+        mark = state.mark_prices.latest_at_or_before(decision)
+        index = state.index_prices.latest_at_or_before(decision)
         premium: float | None = None
         if mark is not None and index is not None and index.value.index_price != 0:
             premium = float(mark.value.mark_price / index.value.index_price - 1)
@@ -753,11 +714,7 @@ class SingleVenueFeatureEngine:
         history_prefix: str,
         oi_change: float | None,
     ) -> tuple[LiquidationFeatureValues, bool]:
-        events = [
-            item.value
-            for item in state.liquidations
-            if start < item.timestamp <= decision
-        ]
+        events = state.liquidations.values_between(start, decision)
         long_notional = sum(
             (
                 event.notional

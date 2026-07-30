@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import os
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -21,7 +21,11 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from cvf import __version__
 from cvf.config import Settings
-from cvf.features.models import CrossVenueFeatureSnapshot, FeatureSnapshot
+from cvf.features.models import (
+    CrossVenueFeatureSnapshot,
+    FeatureSnapshot,
+    FeatureUnavailableCode,
+)
 from cvf.models.enums import EventType, Exchange
 from cvf.utils.fingerprint import (
     canonical_json,
@@ -91,6 +95,9 @@ class FeatureWriterStats:
     backpressure_events: int
     queue_depth: int
     deduplication_cache_size: int
+    average_write_latency_ms: float | None
+    last_write_latency_ms: float | None
+    maximum_write_latency_ms: float | None
     last_file: Path | None
     last_error: str | None
 
@@ -119,6 +126,9 @@ class FeatureScanFilter:
     scopes: frozenset[Exchange] | None = None
     symbols: frozenset[str] | None = None
     windows: frozenset[int] | None = None
+    schema_versions: frozenset[int] | None = None
+    snapshot_ids: frozenset[UUID] | None = None
+    unavailable_codes: frozenset[FeatureUnavailableCode] | None = None
     is_warm: bool | None = None
     is_healthy: bool | None = None
 
@@ -141,6 +151,10 @@ class FeatureScanFilter:
                 validate_canonical_symbol(symbol)
         if self.windows is not None and any(window < 1 for window in self.windows):
             raise ValueError("feature scan windows must be positive")
+        if self.schema_versions is not None and any(
+            version < 1 for version in self.schema_versions
+        ):
+            raise ValueError("feature scan schema versions must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +167,8 @@ class FeatureAudit:
     scopes: tuple[str, ...]
     code_versions: tuple[str, ...]
     config_hashes: tuple[str, ...]
+    unavailable_reason_counts: dict[str, int]
+    unavailable_snapshots: int
     earliest_decision_timestamp: datetime | None
     latest_decision_timestamp: datetime | None
 
@@ -416,6 +432,10 @@ class AsyncFeatureParquetWriter:
         self._backpressure_events = 0
         self._last_file: Path | None = None
         self._last_error: str | None = None
+        self._write_latency_total_ms = 0.0
+        self._write_latency_samples = 0
+        self._last_write_latency_ms: float | None = None
+        self._maximum_write_latency_ms: float | None = None
         self._code_version = __version__
         self._config_hash = settings_fingerprint(settings)
         self._deduplication: OrderedDict[UUID, str] = OrderedDict()
@@ -431,6 +451,13 @@ class AsyncFeatureParquetWriter:
             backpressure_events=self._backpressure_events,
             queue_depth=self._queue.qsize(),
             deduplication_cache_size=len(self._deduplication),
+            average_write_latency_ms=(
+                None
+                if self._write_latency_samples == 0
+                else self._write_latency_total_ms / self._write_latency_samples
+            ),
+            last_write_latency_ms=self._last_write_latency_ms,
+            maximum_write_latency_ms=self._maximum_write_latency_ms,
             last_file=self._last_file,
             last_error=self._last_error,
         )
@@ -580,11 +607,22 @@ class AsyncFeatureParquetWriter:
             grouped[_partition(envelope.snapshot)].append(envelope)
         for partition in sorted(grouped):
             partition_envelopes = grouped[partition]
+            started = asyncio.get_running_loop().time()
             path = await asyncio.to_thread(
                 _write_partition_file,
                 self._root_path,
                 partition,
                 partition_envelopes,
+            )
+            latency_ms = (asyncio.get_running_loop().time() - started) * 1000.0
+            self._write_latency_total_ms += latency_ms
+            self._write_latency_samples += 1
+            self._last_write_latency_ms = latency_ms
+            current_maximum = self._maximum_write_latency_ms
+            self._maximum_write_latency_ms = (
+                latency_ms
+                if current_maximum is None
+                else max(current_maximum, latency_ms)
             )
             self._last_file = path
             self._written_files += 1
@@ -790,6 +828,21 @@ class FeatureParquetReader:
             return False
         if filters.windows is not None and snapshot.window_seconds not in filters.windows:
             return False
+        if (
+            filters.schema_versions is not None
+            and snapshot.schema_version not in filters.schema_versions
+        ):
+            return False
+        if (
+            filters.snapshot_ids is not None
+            and snapshot.feature_snapshot_id not in filters.snapshot_ids
+        ):
+            return False
+        if filters.unavailable_codes is not None and not (
+            {reason.code for reason in snapshot.unavailable_reasons}
+            & filters.unavailable_codes
+        ):
+            return False
         if filters.is_warm is not None and snapshot.is_warm is not filters.is_warm:
             return False
         return (
@@ -863,6 +916,8 @@ def audit_feature_tree(
     scopes: set[str] = set()
     code_versions: set[str] = set()
     config_hashes: set[str] = set()
+    unavailable_reason_counts: Counter[str] = Counter()
+    unavailable_snapshots = 0
     decisions: list[datetime] = []
     rows = 0
     for record in records:
@@ -873,6 +928,11 @@ def audit_feature_tree(
         scopes.add(snapshot.exchange.value)
         code_versions.add(record.code_version)
         config_hashes.add(record.config_hash)
+        if snapshot.unavailable_reasons:
+            unavailable_snapshots += 1
+            unavailable_reason_counts.update(
+                reason.code.value for reason in snapshot.unavailable_reasons
+            )
         decisions.append(snapshot.decision_timestamp)
         rows += 1
         digest_input = canonical_json(
@@ -894,6 +954,8 @@ def audit_feature_tree(
         scopes=tuple(sorted(scopes)),
         code_versions=tuple(sorted(code_versions)),
         config_hashes=tuple(sorted(config_hashes)),
+        unavailable_reason_counts=dict(sorted(unavailable_reason_counts.items())),
+        unavailable_snapshots=unavailable_snapshots,
         earliest_decision_timestamp=min(decisions, default=None),
         latest_decision_timestamp=max(decisions, default=None),
     )
@@ -909,6 +971,18 @@ def compare_feature_trees(
 
     left = audit_feature_tree(left_path, filters=filters)
     right = audit_feature_tree(right_path, filters=filters)
+    return compare_feature_audits(left_path, right_path, left=left, right=right)
+
+
+def compare_feature_audits(
+    left_path: Path,
+    right_path: Path,
+    *,
+    left: FeatureAudit,
+    right: FeatureAudit,
+) -> FeatureConsistencyReport:
+    """Compare two already-validated audits without reading either tree again."""
+
     identical = (
         left.rows == right.rows
         and left.unique_snapshot_ids == right.unique_snapshot_ids

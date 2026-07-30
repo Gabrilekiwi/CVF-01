@@ -99,3 +99,46 @@ async def test_consumer_failure_is_observable() -> None:
 
     with pytest.raises(EventBusError, match="consumer broke"):
         await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_in_flight_consumer_work() -> None:
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    received: list[int] = []
+    bus = NormalizedEventBus(default_queue_capacity=2)
+
+    async def slow_consumer(event: Trade) -> None:
+        entered.set()
+        await release.wait()
+        received.append(int(event.trade_id))
+
+    bus.register("slow", slow_consumer)  # type: ignore[arg-type]
+    await bus.start()
+    await bus.publish(trade(1))
+    await entered.wait()
+    draining = asyncio.create_task(bus.drain())
+    await asyncio.sleep(0)
+
+    assert not draining.done()
+    release.set()
+    await draining
+    assert received == [1]
+    await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_surfaces_consumer_failure_without_hanging() -> None:
+    bus = NormalizedEventBus(default_queue_capacity=2)
+
+    async def fail(_event: Trade) -> None:
+        raise RuntimeError("drain failure")
+
+    bus.register("broken", fail)  # type: ignore[arg-type]
+    await bus.start()
+    await bus.publish(trade(1))
+
+    with pytest.raises(EventBusError, match="drain failure"):
+        await bus.drain()
+    with pytest.raises(EventBusError, match="drain failure"):
+        await bus.close()

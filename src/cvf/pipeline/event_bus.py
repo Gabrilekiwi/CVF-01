@@ -67,18 +67,23 @@ class _ConsumerRuntime:
         try:
             while True:
                 item = await self.queue.get()
-                if item is _STOP:
-                    return
-                assert not isinstance(item, object) or hasattr(item, "event_type")
-                started = loop.time()
-                await self.handler(item)  # type: ignore[arg-type]
-                latency_ms = (loop.time() - started) * 1000.0
-                self.last_processing_latency_ms = latency_ms
-                current_maximum = self.maximum_processing_latency_ms
-                self.maximum_processing_latency_ms = (
-                    latency_ms if current_maximum is None else max(current_maximum, latency_ms)
-                )
-                self.processed_events += 1
+                try:
+                    if item is _STOP:
+                        return
+                    assert not isinstance(item, object) or hasattr(item, "event_type")
+                    started = loop.time()
+                    await self.handler(item)  # type: ignore[arg-type]
+                    latency_ms = (loop.time() - started) * 1000.0
+                    self.last_processing_latency_ms = latency_ms
+                    current_maximum = self.maximum_processing_latency_ms
+                    self.maximum_processing_latency_ms = (
+                        latency_ms
+                        if current_maximum is None
+                        else max(current_maximum, latency_ms)
+                    )
+                    self.processed_events += 1
+                finally:
+                    self.queue.task_done()
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             raise
@@ -182,6 +187,42 @@ class NormalizedEventBus:
                 runtime.maximum_queue_depth,
                 runtime.queue.qsize(),
             )
+
+    async def drain(self) -> None:
+        """Wait until every published event is processed or surface a consumer failure."""
+
+        if not self._started:
+            raise EventBusError("event bus is not running")
+        if self._closed:
+            raise EventBusError("cannot drain a closed event bus")
+        self._raise_consumer_failure()
+        joins = {
+            asyncio.create_task(runtime.queue.join())
+            for runtime in self._consumers.values()
+        }
+        consumers = {
+            runtime.task
+            for runtime in self._consumers.values()
+            if runtime.task is not None
+        }
+        pending_joins = set(joins)
+        try:
+            while pending_joins:
+                done, _ = await asyncio.wait(
+                    pending_joins | consumers,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                stopped_consumers = done & consumers
+                if stopped_consumers:
+                    self._raise_consumer_failure()
+                    raise EventBusError("normalized event consumer stopped during drain")
+                pending_joins.difference_update(done)
+        finally:
+            for join in pending_joins:
+                join.cancel()
+            if pending_joins:
+                await asyncio.gather(*pending_joins, return_exceptions=True)
+        self._raise_consumer_failure()
 
     async def close(self) -> None:
         """Drain all queues and surface any consumer failure."""

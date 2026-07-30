@@ -13,11 +13,12 @@ from uuid import uuid4
 
 import pytest
 
+from cvf.clock import DecisionScheduler, DecisionTick, TickKind
 from cvf.config import load_settings
 from cvf.features import FeatureStatePipeline, MarketStateStore
-from cvf.models import Exchange, Trade
+from cvf.models import Exchange, LiquidationEvent, Trade
 from cvf.pipeline import NormalizedEventBus
-from cvf.replay import RawParquetReader, ReplayOrder, ReplayRunner
+from cvf.replay import RawParquetReader, RawRecordNormalizer, ReplayOrder, ReplayRunner
 from cvf.storage import AsyncPartitionedParquetWriter, RawMarketRecord, compact_raw_tree
 
 NOW = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
@@ -60,6 +61,45 @@ def agg_trade(sequence: int, offset_ms: int) -> RawMarketRecord:
         connection_generation=3,
         raw_payload=json.dumps(payload, separators=(",", ":")).encode(),
     )
+
+
+def test_okx_replay_filters_unconfigured_liquidation_instruments() -> None:
+    normalizer = RawRecordNormalizer()
+    metadata = RawMarketRecord(
+        exchange=Exchange.OKX,
+        symbol="BTC-USDT-PERP",
+        channel="instrument_metadata",
+        message_kind="market_data",
+        transport="rest",
+        local_receive_timestamp=NOW,
+        connection_generation=0,
+        raw_payload=Path("tests/fixtures/okx/instrument_btc_live.json").read_bytes(),
+    )
+    assert normalizer.normalize(metadata) == []
+
+    payload = json.loads(
+        Path("tests/fixtures/okx/liquidation_official.json").read_text(encoding="utf-8")
+    )
+    unrelated = dict(payload["data"][0])
+    unrelated["instId"] = "O-USDT-SWAP"
+    payload["data"].append(unrelated)
+    record = RawMarketRecord(
+        exchange=Exchange.OKX,
+        symbol="*",
+        channel="liquidation-orders",
+        message_kind="market_data",
+        transport="websocket",
+        exchange_timestamp=NOW,
+        local_receive_timestamp=NOW,
+        connection_generation=1,
+        raw_payload=json.dumps(payload, separators=(",", ":")).encode(),
+    )
+
+    events = normalizer.normalize(record)
+
+    assert len(events) == 1
+    assert isinstance(events[0], LiquidationEvent)
+    assert events[0].symbol == "BTC-USDT-PERP"
 
 
 @pytest.mark.asyncio
@@ -108,6 +148,32 @@ async def test_reader_replays_live_normalization_equivalently() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reader_orders_one_physically_unsorted_file_across_read_batches() -> None:
+    with scratch_directory() as temporary:
+        raw = temporary / "raw"
+        writer = AsyncPartitionedParquetWriter(
+            root_path=raw,
+            batch_rows=5,
+            flush_seconds=60,
+            queue_capacity=10,
+        )
+        await writer.start()
+        for sequence in (5, 1, 4, 2, 3):
+            await writer.write(agg_trade(sequence, sequence))
+        await writer.close()
+
+        records = list(RawParquetReader(raw, batch_size=2).iter_records())
+
+        assert [record.sequence_id for record in records] == [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
     with scratch_directory() as temporary:
         raw = temporary / "raw"
@@ -127,6 +193,16 @@ async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
             connection_generation=0,
             raw_payload=Path("tests/fixtures/okx/instrument_btc_live.json").read_bytes(),
         )
+        eth_metadata = RawMarketRecord(
+            exchange=Exchange.OKX,
+            symbol="ETH-USDT-PERP",
+            channel="instrument_metadata",
+            message_kind="market_data",
+            transport="rest",
+            local_receive_timestamp=NOW + timedelta(milliseconds=1),
+            connection_generation=0,
+            raw_payload=Path("tests/fixtures/okx/instrument_eth_live.json").read_bytes(),
+        )
         trade_record = RawMarketRecord(
             exchange=Exchange.OKX,
             symbol="BTC-USDT-PERP",
@@ -141,6 +217,7 @@ async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
         await writer.start()
         await writer.write(trade_record)
         await writer.write(metadata)
+        await writer.write(eth_metadata)
         await writer.close()
 
         replayed: list[Trade] = []
@@ -157,8 +234,57 @@ async def test_okx_replay_primes_contract_metadata_before_event_time() -> None:
         assert len(replayed) == 1
         assert replayed[0].contract_quantity is not None
         assert replayed[0].quantity == replayed[0].contract_quantity * Decimal("0.01")
-        assert summary.raw_records == 2
-        assert summary.skipped_records == 1
+        assert summary.raw_records == 3
+        assert summary.skipped_records == 2
+
+
+@pytest.mark.asyncio
+async def test_replay_ticks_include_all_events_at_the_decision_boundary() -> None:
+    class CountingEventBus(NormalizedEventBus):
+        def __init__(self) -> None:
+            super().__init__(default_queue_capacity=2)
+            self.drain_calls = 0
+
+        async def drain(self) -> None:
+            self.drain_calls += 1
+            await super().drain()
+
+    bus = CountingEventBus()
+    feature_state = FeatureStatePipeline(
+        MarketStateStore(load_settings(environ={}).features)
+    )
+    bus.register("feature-state", feature_state.consume)
+    observed_trade_counts: list[tuple[datetime, int]] = []
+
+    async def capture_tick(tick: DecisionTick) -> None:
+        if tick.kind is not TickKind.FEATURE:
+            return
+        state = feature_state.store.state(Exchange.BINANCE, "BTC-USDT-PERP")
+        observed_trade_counts.append((tick.timestamp, len(state.trades)))
+
+    scheduler = DecisionScheduler(
+        start=NOW,
+        feature_interval=timedelta(seconds=1),
+        signal_interval=timedelta(seconds=60),
+    )
+    await ReplayRunner(
+        event_bus=bus,
+        scheduler=scheduler,
+        tick_sink=capture_tick,
+        speed=0,
+    ).run(
+        [
+            agg_trade(1, 1_000),
+            agg_trade(2, 1_500),
+            agg_trade(3, 2_000),
+        ]
+    )
+
+    assert observed_trade_counts == [
+        (NOW + timedelta(seconds=1), 1),
+        (NOW + timedelta(seconds=2), 3),
+    ]
+    assert bus.drain_calls == 2
 
 
 @pytest.mark.asyncio
