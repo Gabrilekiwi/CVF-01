@@ -190,13 +190,14 @@ The retained raw tree was compacted without modifying its source:
 - content digest
   `d001dddf13ef8c797117a5a3de0e0b49a519d8b388f6cd4a96514e578e894ecd`.
 
-The recorded pre-release implementation run produced 32,478 audited snapshots in each replay
+The recorded v0.3.0 release-candidate run produced 32,478 audited snapshots in each replay
 (21,642 single-venue and 10,836 cross-venue), zero no-lookahead violations, zero signals,
 orders, or private-API calls, and exact logical digest
-`782a997fc98e6ac3ce1f8a5ade0c5943fc9cdeb9939d84bc71a0fe1bb31b575e` in both trees.
+`e885ba7f1c2305bbf7d768e2ae56fe8dd702bfce3f568faebceeb620424c92c4` in both trees.
 The two physical trees deliberately differed (198 versus 252 files) while their logical records
-remained identical. Replay throughput was 1,666 and 1,511 raw records/second, respectively,
-or 1.29× and 1.17× the captured wall-clock rate.
+remained identical. Replay throughput was 1,654 and 1,573 raw records/second, respectively,
+or 1.28× and 1.22× the captured wall-clock rate. Both audited trees report code version
+`0.3.0`.
 
 This evidence also exposes a real limitation: all retained fixed-set snapshots have at least one
 structured unavailable reason. The configured Z-score history is 1,800 seconds, while the
@@ -217,7 +218,7 @@ cvf stability-phase3 `
 ```
 
 `--maximum-iterations 1` verifies the harness and emits an honest pending result, but is not a
-six-hour acceptance. The recorded two-replay observation totals about 49.04 minutes. A true
+six-hour acceptance. The recorded two-replay observation totals about 48.19 minutes. A true
 six-hour continuous live-feed/reconnect/resynchronization observation has not been performed
 and remains a release limitation; repeated fixed-data process time must not be described as
 equivalent evidence.

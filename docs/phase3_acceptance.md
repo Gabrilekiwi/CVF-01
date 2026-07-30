@@ -7,7 +7,7 @@ deterministic replay, strict no-lookahead, feature schema/lineage audit, above-r
 throughput, and the no-signal/order/private-API safety boundary.
 
 The six-hour criterion is not complete. The available process-lifetime observation is about
-49.04 minutes across two independent replays; it is not a continuous live-feed,
+48.19 minutes across two independent replays; it is not a continuous live-feed,
 reconnect/resynchronization soak. This limitation is intentional and machine-readable in the
 acceptance result.
 
@@ -67,10 +67,11 @@ Receive-time is the correct decision ordering for this dataset because it was co
 delayed exchange timestamps and would not reproduce live scheduling. Exchange timestamps are
 still retained, measured, and rejected if they exceed the decision boundary.
 
-## Recorded fixed-set result
+## Recorded v0.3.0 fixed-set result
 
-The pre-release implementation run completed in 3,275.4 seconds including input audit, both
-replays, both feature audits, and exact comparison.
+The v0.3.0 release-candidate command completed in about 54.5 minutes including input audit,
+both replays, both feature audits, and exact comparison. The two replay process-lifetime
+observations total 2,891.54 seconds.
 
 | Measure | Run 1 | Run 2 |
 |---|---:|---:|
@@ -81,16 +82,20 @@ replays, both feature audits, and exact comparison.
 | Single-venue snapshots | 21,642 | 21,642 |
 | Cross-venue snapshots | 10,836 | 10,836 |
 | Physical files | 198 | 252 |
-| Replay wall time | 1,399.35 s | 1,543.21 s |
-| Throughput | 1,666.02 rows/s | 1,510.71 rows/s |
-| Captured-rate multiplier | 1.290× | 1.170× |
-| Peak RSS | 6,671,761,408 B | 6,542,106,624 B |
+| Replay wall time | 1,409.76 s | 1,481.79 s |
+| Throughput | 1,653.72 rows/s | 1,573.34 rows/s |
+| Captured-rate multiplier | 1.281× | 1.219× |
+| Peak RSS | 6,526,091,264 B | 6,624,317,440 B |
 | No-lookahead violations | 0 | 0 |
 | Signals/orders/private APIs | 0/0/0 | 0/0/0 |
 
 Both feature trees contain 32,478 unique snapshot IDs and exact logical digest
-`782a997fc98e6ac3ce1f8a5ade0c5943fc9cdeb9939d84bc71a0fe1bb31b575e`.
+`e885ba7f1c2305bbf7d768e2ae56fe8dd702bfce3f568faebceeb620424c92c4`.
+Both audits report code version `0.3.0`; their config hash is
+`120d54938b8cd89e3ce741f2bdb2943365868fa01b3f62892230985375a84af6`.
 Different file and flush boundaries therefore do not change logical output.
+Both per-run checkpoints reached `AUDIT_COMPLETE` and are bound to package-source digest
+`5aa9819151b54c34e5d7f2296bb7f3f95180426ec9864a6284d24eab843cbe81`.
 
 Normalized event counts per run:
 
@@ -113,9 +118,11 @@ boundaries and observed 361 reserved signal boundaries, but produced no signal p
 Writer evidence:
 
 - no backpressure and no writer errors;
-- run 1: 33 flushes, average file latency 828.84 ms, maximum 3,110 ms;
-- run 2: 42 flushes, average file latency 893.67 ms, maximum 4,047 ms;
-- final RSS was lower than initial RSS in both runs.
+- run 1: 33 flushes, average file latency 844.69 ms, maximum 3,579 ms;
+- run 2: 42 flushes, average file latency 864.09 ms, maximum 3,796 ms;
+- run 1 RSS changed from 4,886,568,960 B to 5,331,152,896 B; run 2 changed from
+  5,483,147,264 B to 5,275,021,312 B;
+- this mixed 48.19-minute result is not evidence of six-hour memory stability.
 
 ## Availability limitation
 
