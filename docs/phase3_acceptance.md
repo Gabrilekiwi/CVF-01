@@ -159,3 +159,28 @@ longer live capture is still required to demonstrate sustained fully warm and al
 
 The pending criteria must remain visible in release notes. They are not permission to enable
 signals or trading.
+
+## v0.3.0 release gates
+
+The final release-candidate gates were rerun on 2026-07-30:
+
+- 174 pytest tests passed;
+- Ruff passed;
+- strict mypy passed for 66 source files;
+- `pip check` reported no broken requirements;
+- `python -m build --no-isolation` produced the sdist and wheel;
+- a fresh venv installed only `cvf_01-0.3.0-py3-none-any.whl` with `--no-index --no-deps`;
+- that venv imported code from its own `site-packages`, reported package and metadata version
+  `0.3.0`, loaded the strategy version `0.3.0`, and passed `pip check` using the already
+  validated local dependency environments as an offline dependency source;
+- wheel-installed `cvf --once` exited zero and reported `network_attempted=false` for both
+  exchanges;
+- wheel-installed main, replay, feature audit/compare, acceptance, and stability help commands
+  all exited zero;
+- `accept-phase3 --resume` re-audited all 450 feature files and repeated the exact comparison
+  in 207.2 seconds with exit code zero.
+
+Release artifact SHA-256:
+
+- wheel: `9fb9359c9f6e21cdf516cee38e6febc96c695b895cdb9aa073a38af3fbd21944`;
+- sdist: `649939853aa11fefd8d31a2957b14684adf37c4cc4b9da3da152bda0d8dd8439`.
