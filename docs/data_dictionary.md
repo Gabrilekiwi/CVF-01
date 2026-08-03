@@ -1,5 +1,12 @@
 # CVF-01 Data Dictionary
 
+This dictionary reflects the v0.3.1 corrective release. The published v0.3.0 release remains
+historical; v0.3.1 corrects feature identity, missing-value semantics, normalized-event
+journaling, restart idempotence, and acceptance evidence. The authoritative v0.3.1 fixed
+30-minute acceptance is retained under
+`data/processed/phase3-acceptance/fixed-30m-v0.3.1-final-2`; the continuous six-hour live
+observation has not completed.
+
 ## 1. Conventions
 
 - Canonical symbols are uppercase `BASE-QUOTE-PERP`.
@@ -10,12 +17,21 @@
   treated as base-asset quantity.
 - `sequence_id` is nullable because some public channels have no usable sequence. Null never
   means that ordering was validated.
-- `raw_payload_reference` points to the retained raw record/partition rather than copying the
-  payload into each structured row.
+- For normalized market/health events, `raw_payload_reference` points to retained raw lineage.
+  A single-venue feature instead uses a canonical
+  `feature-sources://sha256-sum-xor-v1/<source-fingerprint>` over all eligible semantic source
+  content; cross-venue lineage includes both source snapshot IDs plus the count and SHA-256 of
+  the exact prior paired-spread history.
+- `sha256-sum-xor-v1` hashes each semantic source with a domain-separated SHA-256 leaf after
+  excluding nondeterministic normalization time. Its final fingerprint binds count, modular
+  digest sum, digest XOR, and oldest/newest source timestamps. It is a mergeable,
+  order-independent probabilistic multiset commitment, not a canonical-list digest.
 
 ## 2. Common event fields
 
-Every normalized market, health, feature, signal, and paper-trading event inherits these fields:
+Implemented normalized market, health, and feature records inherit these fields. Inactive
+Phase 4/5 data-contract classes use the same base shape, but no current producer emits signal or
+paper-trading events:
 
 | Field | Type | Nullable | Meaning |
 |---|---|---:|---|
@@ -121,6 +137,20 @@ activity samples and not complete liquidation totals.
 
 Exchange-wide health uses `symbol="*"`.
 
+After connector deduplication and normalization, accepted market events are persisted in raw
+Parquet with `channel="_normalized_event"`. The collector's periodic `ExchangeHealth` records
+are written through the same journal. Their `raw_payload` is canonical typed JSON and their row
+metadata must match the decoded event exactly during replay. These internal rows supplement the
+original public WebSocket/REST payload records.
+
+### Receive-time feature timeline
+
+`FeatureRuntime` is the shared state/calculation/persistence owner for collection, standard
+replay, and acceptance. `ReceiveTimeFeatureDriver` orders normalized events by
+`local_receive_timestamp` within `features.receive_time_reorder_ms` (250 ms by default). Its
+buffer is bounded; an event at or behind the watermark fails closed. Live wall-clock advancement
+continues decision ticks during quiet periods. Standard feature replay is receive-time-only.
+
 ### `FeatureSnapshot` schema v1
 
 The legacy `MarketFeature.values` map remains a compatibility model. Phase 3 uses the typed,
@@ -128,21 +158,23 @@ versioned `FeatureSnapshot` contract:
 
 | Field | Meaning |
 |---|---|
-| `feature_snapshot_id` | UUID joining later signals to exact features |
+| `feature_snapshot_id` | Deterministic UUID binding code/config, source lineage/content, availability, and typed feature values |
 | `schema_version`, `strategy_version` | Immutable schema and strategy identities |
 | `calculation_timestamp`, `decision_timestamp` | Calculation time and no-lookahead boundary |
 | `window_seconds` | Trailing `(decision-window, decision]` interval |
 | `book_generation`, `source_sequence_id` | Exact order-book lifecycle/source boundary |
 | `source_event_count` | Valid accepted source events used |
 | `oldest_source_timestamp`, `newest_source_timestamp` | Auditable event-time bounds |
-| `data_age_ms` | Age of the newest required source at decision time |
+| `data_age_ms` | Age of the newest source at decision time; null when no source exists |
 | `is_warm`, `is_healthy` | Separate statistical warmup and operational health gates |
 | `unavailable_reasons` | Structured missing, stale, generation, health, or backlog blockers |
 | typed feature groups | Trade flow, order book, price, OI, crowding, and liquidation |
 
-Null means unavailable/undefined and is distinct from true numeric zero. A non-warm or unhealthy
-snapshot must contain at least one structured reason. A source timestamp after the decision
-boundary is rejected.
+Null means unavailable/undefined and is distinct from true numeric zero. An empty snapshot must
+use null source bounds and null `data_age_ms`; it cannot fabricate age `0`. A non-warm or
+unhealthy snapshot must contain at least one structured reason. A source timestamp after the
+decision boundary is rejected. A metric with zero historical variance has no defined Z-score;
+it remains null and blocks warm readiness rather than becoming numeric `0`.
 
 Single-venue typed groups include:
 
@@ -165,7 +197,7 @@ The Phase 3C cross-venue record has `exchange=CROSS_VENUE` and preserves:
 
 | Group | Values |
 |---|---|
-| lineage | strategy/code versions, config hash, deterministic ID, both source snapshot IDs, book generations, event count, and source time bounds |
+| lineage | strategy/code versions, config hash, deterministic ID, both source snapshot IDs, prior paired-spread history count/SHA-256, book generations, event count, and source time bounds |
 | alignment | both source IDs/timestamps/ages, absolute data-age difference, source timestamp difference, typed status, quality, and structured reasons |
 | price | both mids, signed/absolute spread, explicit symmetric denominator, percentage spread/Z-score, return/impulse direction, impulse strength, volatility, and relative-spread differences |
 | order flow | taker and OFI direction/difference, taker strength, depth difference, liquidity additions/removals, recovery difference, and typed liquidity divergence |
@@ -184,6 +216,10 @@ paired history produces null plus a structured reason; it never becomes numeric 
 Cross-venue OI uses percentage change and venue-local `PriceOpenInterestState` only. Absolute OI
 is not compared because venue contract units are not interchangeable.
 
+`spread_history_pair_count` and `spread_history_sha256` describe the complete eligible prior
+paired-spread sequence used at that decision. They are persisted in the typed payload and bound
+into `feature_snapshot_id`; they are not advisory audit labels.
+
 ### Feature Parquet schema v1
 
 Physical layout:
@@ -201,7 +237,7 @@ data/processed/
 |---|---|
 | identity/partition | `feature_schema_version`, feature UUID, scope, symbol, window, decision/calculation timestamps |
 | runtime lineage | strategy version, code version, full config SHA-256 |
-| source lineage | source snapshot IDs, source sequence, event count, oldest/newest source times, raw reference, venue book generations |
+| source lineage | source snapshot IDs, prior paired-spread history count/SHA-256, source sequence, event count, oldest/newest source times, raw reference, venue book generations |
 | availability | data age, warm/healthy flags, structured top-level reason codes |
 | content integrity | canonical typed `payload_json` and its `payload_sha256` |
 
@@ -209,6 +245,18 @@ The canonical payload excludes computed display fields and can be validated dire
 `FeatureSnapshot` or `CrossVenueFeatureSnapshot`. Query columns must exactly match that payload.
 Any schema drift, hash mismatch, metadata mismatch, wrong partition, duplicate UUID, or
 non-monotonic file order fails the reader/audit.
+
+The writer's `.feature-deduplication-v1.sqlite3` is a disposable, rebuildable ID/content index,
+not part of the feature schema and not the source of truth. Committed Parquet rebuilds it on
+every writer start. The bounded in-memory ID cache is only a hot-path accelerator.
+
+Each writable feature root also carries `.feature-writer-v1.lock`. A process-local registry and
+an OS-level exclusive lock (`msvcrt` on Windows, `flock` on Linux/Unix) make `root` and its
+`root/feature_schema=v1` alias one writer claim. The claim is acquired before stale SQLite
+sidecars can be removed or the index rebuilt, is held until queue drain and full close, and makes
+a competing instance or process fail closed. Startup/close failure and cancellation release the
+claim; process exit releases the OS lock. The persistent lock file is coordination metadata, not
+feature schema or a source of truth.
 
 Tree comparison hashes logical records rather than filenames. Live and replay outputs may use
 different batch boundaries but must have identical IDs, canonical payloads, code/config lineage,
@@ -228,15 +276,34 @@ They are written outside the feature Parquet tree and include:
 | performance | throughput and captured-rate multiplier, initial/final/peak RSS, calculation/receive/write latency |
 | persistence | accepted/deduplicated snapshots, files, flushes, backpressure, worker error, feature audit |
 | correctness | no-lookahead violations, per-tree digest, exact comparison, warm/health/reason counts |
-| safety | signal, order, and private-API counters |
-| stability | requested and actually observed seconds, completion/pending status, per-iteration results |
+| safety | runtime component inventory, observed feature-output types, and an explicit statement that network requests are not instrumented as counters |
+| stability | fixed-replay stress duration kept separate from the pending continuous live-feed soak |
 
 The requested stability duration is never substituted for actual observation time. A capped or
 interrupted run remains machine-readably incomplete.
 
-## 6. Signal model
+The authoritative 2026-07-31 v0.3.1 evidence at
+`data/processed/phase3-acceptance/fixed-30m-v0.3.1-final-2` contains 32,490 unique feature rows
+in each tree: 21,660 single-venue plus 10,830 cross-venue snapshots. Both trees have exact
+logical digest
+`09ebc2e9039ad04705d7bae65452c84507458f7a064d6c274205019396e38ba2`,
+zero no-lookahead violations, and package-source SHA-256
+`5e05912737c52a21d9d075d301bee90ad00026deafba085c65da9ea87c7e7d12`.
+Run throughput was 1.237678x/1.229822x event time
+(1,598.962/1,588.812 raw records per second). The 2,925.389-second fixed-replay observation is
+not a live soak: `live_stability_duration_completed=false`, so the continuous six-hour
+public-feed criterion remains pending.
 
-`TradingSignal` adds:
+The older `fixed-30m-v0.3.1-final` tree predates the final feature-root locking,
+journal-lineage, and cancellation-race corrections. It is superseded diagnostic evidence and
+must not be presented as the current acceptance result.
+
+## 6. Planned signal schema (Phase 4; not implemented)
+
+The following table describes an inactive contract/proposal only. Data-model classes may exist
+for validation and planning, but the current source tree has no score calculator, signal state
+machine, signal producer, or signal persistence pipeline. The active v0.3.1 configuration has no
+score weights or LONG/SHORT signal thresholds. A future signal record is expected to add:
 
 | Field | Meaning |
 |---|---|
@@ -254,9 +321,14 @@ interrupted run remains machine-readably incomplete.
 | `feature_snapshot_id` | Exact feature join key |
 | `strategy_version` | Immutable decision logic/config version |
 
-Long entry levels satisfy `stop < entry < TP1 < TP2`; short levels are symmetric.
+Future long-entry validation must require `stop < entry < TP1 < TP2`; short levels would be
+symmetric.
 
-## 7. Paper-trading models
+## 7. Planned paper-trading schemas (Phase 5; not implemented)
+
+The following objects are inactive contract/design targets only. No simulated execution,
+position ledger, fill engine, fee/slippage accounting, or risk runtime exists in the current
+release, and active configuration contains no execution, exit, or risk thresholds.
 
 ### `SimulatedOrder`
 
@@ -290,6 +362,7 @@ Implemented layout:
 
 ```text
 data/raw/date=YYYY-MM-DD/exchange=BINANCE/symbol=BTC-USDT-PERP/channel=aggTrade/*.parquet
+data/raw/date=YYYY-MM-DD/exchange=BINANCE/symbol=BTC-USDT-PERP/channel=_normalized_event/*.parquet
 ```
 
 | Field | Type | Meaning |
@@ -305,7 +378,33 @@ data/raw/date=YYYY-MM-DD/exchange=BINANCE/symbol=BTC-USDT-PERP/channel=aggTrade/
 | `normalization_timestamp` | UTC timestamp | Nullable for raw-first writes |
 | `sequence_id` | string | Nullable venue sequence/trade ID |
 | `connection_generation` | int64 | WebSocket lifecycle generation |
-| `raw_payload` | binary | Exact received frame or HTTP response bytes |
+| `raw_payload` | binary | Exact received frame/HTTP response, or canonical normalized-event JSON for the internal journal |
+
+### Collection lifecycle manifest
+
+Every new `v0.3.1` collection root is exclusively claimed by
+`_collection_manifest.json` before a producer starts:
+
+| Field | Meaning |
+|---|---|
+| `run_id`, `started_at` | Single-run ownership and UTC start |
+| `terminal` | `IN_PROGRESS` or `CLEAN_END` |
+| `code_version`, `code_sha256` | Capture package identity |
+| `strategy_version`, `settings_sha256` | Complete runtime configuration identity |
+| `terminal_at`, `feature_timeline_end_at` | Present only at clean completion; timeline end is within collection lifetime |
+| `normalized_event_count` | Exact reconciled post-dedup journal event count |
+| `raw_audit` | Logical row, UUID, content, payload-byte, partition, and time evidence |
+
+`CLEAN_END` also requires exactly one internal feature-timeline terminal marker, no normalized
+event after that marker, matching journal counts, matching raw audit, and no unfinished `.tmp`
+or compaction sentinel. The manifest proves clean collection completeness and lineage; it is not
+a per-source-frame 0/1/N normalization ledger, database WAL, or authorization to merge runs.
 
 Malformed WebSocket bytes are persisted under `_unparsed` before the session is recovered.
-Connection lifecycle records use wildcard symbol and `_session_*` channels.
+Connection lifecycle records use wildcard symbol and `_session_*` channels. Journal rows use
+`message_kind="normalized_event"` and `transport="internal"`; their embedded typed event retains
+the original raw reference where one exists. Outer row metadata, including connection
+generation, must match the decoded typed event. A reconciled `CLEAN_END` tree is replayed from
+that complete post-dedup journal without partial filters. A legacy tree with no manifest,
+journal, or incomplete evidence can be re-normalized from public payloads; any partial strict
+evidence fails closed.
