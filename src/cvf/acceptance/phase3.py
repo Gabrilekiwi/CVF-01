@@ -3,59 +3,46 @@
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import hashlib
 import json
 import os
-import sys
 import time
-from collections import Counter, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import Enum
-from itertools import chain
 from pathlib import Path
 from typing import Final, Literal
 
 from pydantic import TypeAdapter
 
 from cvf import __version__
-from cvf.clock import DecisionScheduler, DecisionTick, TickKind
 from cvf.config import Settings
-from cvf.features import (
-    CrossVenueFeatureEngine,
-    FeatureSnapshot,
-    FeatureStatePipeline,
-    FeatureStatePipelineStats,
-    MarketStateStore,
-    SingleVenueFeatureEngine,
+from cvf.features import FeatureStatePipelineStats
+from cvf.features.runtime import (
+    FeatureRuntime,
+    ReceiveTimeFeatureDriver,
+    RuntimeLatency,
 )
-from cvf.features.models import (
-    AlignmentStatus,
-    CrossVenueFeatureSnapshot,
-    FeatureUnavailableCode,
-)
-from cvf.models.enums import Exchange
-from cvf.models.market import OrderBookSnapshot
-from cvf.normalization.common import NormalizedMarketEvent
+from cvf.monitoring.process import current_rss_bytes
 from cvf.pipeline import ConsumerStats, NormalizedEventBus
 from cvf.replay import (
     RawParquetReader,
+    RawScanFilter,
     ReplayOrder,
     ReplayRunner,
+    ReplaySourceMode,
     ReplaySummary,
+    resolve_replay_source,
 )
-from cvf.replay.ordering import replay_timestamp
 from cvf.storage.compact import RawAudit, audit_raw_tree
 from cvf.storage.features import (
-    AsyncFeatureParquetWriter,
     FeatureAudit,
     FeatureConsistencyReport,
     FeatureWriterStats,
     compare_feature_audits,
 )
-from cvf.storage.raw import RawMarketRecord
+from cvf.storage.raw import NORMALIZED_EVENT_JOURNAL_CHANNEL
 from cvf.utils.fingerprint import settings_fingerprint
 
 
@@ -76,6 +63,20 @@ class ResourceMetrics:
     wall_duration_seconds: float
     process_cpu_seconds: float
     process_cpu_percent_of_one_core: float
+
+
+@dataclass(frozen=True, slots=True)
+class SafetyBoundaryEvidence:
+    """Runtime evidence for the deliberately feature-only acceptance graph."""
+
+    execution_mode: Literal["OFFLINE_FIXED_DATASET_REPLAY"]
+    input_transport: Literal["LOCAL_PARQUET"]
+    component_types: tuple[str, ...]
+    component_graph_matches_expected: bool
+    output_event_type_counts: dict[str, int]
+    forbidden_output_events_observed: int
+    network_request_instrumentation_enabled: bool
+    claim_scope: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,10 +103,9 @@ class Phase3RunMetrics:
     unavailable_reason_counts: dict[str, int]
     book_generation_rebuilds: int
     no_lookahead_violations: int
-    signal_outputs: int
-    order_outputs: int
-    private_api_requests: int
+    safety_evidence: SafetyBoundaryEvidence
     replay_order: ReplayOrder
+    replay_source_mode: ReplaySourceMode
     writer_batch_rows: int
     writer_flush_seconds: float
     throughput_records_per_second: float
@@ -128,10 +128,10 @@ class Phase3AcceptanceReport:
     throughput_above_realtime: bool
     feature_files_audited: bool
     safety_boundary_preserved: bool
-    requested_stability_seconds: float
-    actual_stability_observation_seconds: float
-    full_stability_duration_completed: bool
-    full_stability_status: str
+    requested_live_stability_seconds: float
+    fixed_replay_observation_seconds: float
+    live_stability_duration_completed: bool
+    live_stability_status: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,253 +148,74 @@ _RUN_CHECKPOINT_ADAPTER: Final[TypeAdapter[_Phase3RunCheckpoint]] = TypeAdapter(
 )
 
 
-class _LatencyAccumulator:
-    def __init__(self) -> None:
-        self._samples = 0
-        self._total = 0.0
-        self._minimum: float | None = None
-        self._maximum: float | None = None
-
-    def add(self, value_ms: float) -> None:
-        self._samples += 1
-        self._total += value_ms
-        self._minimum = value_ms if self._minimum is None else min(self._minimum, value_ms)
-        self._maximum = value_ms if self._maximum is None else max(self._maximum, value_ms)
-
-    @property
-    def metrics(self) -> LatencyMetrics:
-        return LatencyMetrics(
-            samples=self._samples,
-            average_ms=None if self._samples == 0 else self._total / self._samples,
-            minimum_ms=self._minimum,
-            maximum_ms=self._maximum,
-        )
+def _latency_metrics(value: RuntimeLatency) -> LatencyMetrics:
+    return LatencyMetrics(
+        samples=value.samples,
+        average_ms=value.average_ms,
+        minimum_ms=value.minimum_ms,
+        maximum_ms=value.maximum_ms,
+    )
 
 
-class _EventObserver:
-    def __init__(self) -> None:
-        self.receive_latency = _LatencyAccumulator()
-        self.book_generations: dict[tuple[Exchange, str], int] = {}
-        self.book_generation_rebuilds = 0
-
-    def observe(self, event: NormalizedMarketEvent) -> None:
-        receive_latency_ms = (
-            event.local_receive_timestamp - event.exchange_timestamp
-        ).total_seconds() * 1000.0
-        self.receive_latency.add(receive_latency_ms)
-        if isinstance(event, OrderBookSnapshot):
-            key = (event.exchange, event.symbol)
-            previous = self.book_generations.get(key)
-            if previous is not None and previous != event.generation:
-                self.book_generation_rebuilds += 1
-            self.book_generations[key] = event.generation
+_EXPECTED_ACCEPTANCE_COMPONENT_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "cvf.features.runtime.FeatureRuntime",
+        "cvf.features.runtime.ReceiveTimeFeatureDriver",
+        "cvf.features.pipeline.FeatureStatePipeline",
+        "cvf.features.state.MarketStateStore",
+        "cvf.pipeline.event_bus.NormalizedEventBus",
+        "cvf.replay.raw_reader.RawParquetReader",
+        "cvf.replay.runner.ReplayRunner",
+        "cvf.storage.features.AsyncFeatureParquetWriter",
+    }
+)
 
 
-class _FeatureTickSink:
-    def __init__(
-        self,
-        *,
-        settings: Settings,
-        state: MarketStateStore,
-        writer: AsyncFeatureParquetWriter,
-    ) -> None:
-        self._settings = settings
-        self._state = state
-        self._writer = writer
-        self._single_engine = SingleVenueFeatureEngine(settings)
-        self._cross_engine = CrossVenueFeatureEngine(settings)
-        history_items = max(
-            2,
-            int(
-                settings.features.zscore_lookback_seconds
-                / settings.timing.feature_update_seconds
-            )
-            + 2,
-        )
-        self._history_items = history_items
-        self._history: dict[
-            tuple[Exchange, str, int],
-            deque[FeatureSnapshot],
-        ] = {}
-        self.calculation_latency = _LatencyAccumulator()
-        self.enqueue_latency = _LatencyAccumulator()
-        self.feature_ticks = 0
-        self.signal_boundaries = 0
-        self.single_snapshots = 0
-        self.cross_snapshots = 0
-        self.unavailable_snapshots = 0
-        self.open_interest_stale_snapshots = 0
-        self.non_aligned_cross_snapshots = 0
-        self.unavailable_reasons: Counter[str] = Counter()
-        self.no_lookahead_violations = 0
-
-    def _history_for(
-        self,
-        exchange: Exchange,
-        symbol: str,
-        window_seconds: int,
-    ) -> deque[FeatureSnapshot]:
-        return self._history.setdefault(
-            (exchange, symbol, window_seconds),
-            deque(maxlen=self._history_items),
-        )
-
-    @staticmethod
-    def _source_is_in_the_future(
-        snapshot: FeatureSnapshot | CrossVenueFeatureSnapshot,
-    ) -> bool:
-        newest = snapshot.newest_source_timestamp
-        if newest is not None and newest > snapshot.decision_timestamp:
-            return True
-        if isinstance(snapshot, CrossVenueFeatureSnapshot):
-            return any(
-                source is not None and source > snapshot.decision_timestamp
-                for source in (
-                    snapshot.alignment.binance_source_timestamp,
-                    snapshot.alignment.okx_source_timestamp,
-                )
-            )
-        return False
-
-    def _record_snapshot(
-        self,
-        snapshot: FeatureSnapshot | CrossVenueFeatureSnapshot,
-    ) -> None:
-        reasons = tuple(reason.code for reason in snapshot.unavailable_reasons)
-        if reasons:
-            self.unavailable_snapshots += 1
-            self.unavailable_reasons.update(reason.value for reason in reasons)
-        if FeatureUnavailableCode.OPEN_INTEREST_STALE in reasons:
-            self.open_interest_stale_snapshots += 1
-        if (
-            isinstance(snapshot, CrossVenueFeatureSnapshot)
-            and snapshot.alignment.status is not AlignmentStatus.ALIGNED
-        ):
-            self.non_aligned_cross_snapshots += 1
-        if self._source_is_in_the_future(snapshot):
-            self.no_lookahead_violations += 1
-            raise RuntimeError(
-                f"future source detected in feature snapshot {snapshot.feature_snapshot_id}"
-            )
-
-    async def consume(self, tick: DecisionTick) -> None:
-        if tick.kind is TickKind.SIGNAL:
-            self.signal_boundaries += 1
-            return
-        self.feature_ticks += 1
-        calculation_started = time.perf_counter()
-        singles = self._single_engine.calculate_all(
-            self._state.states,
-            decision_timestamp=tick.timestamp,
-        )
-        for snapshot in singles:
-            self._history_for(
-                snapshot.exchange,
-                snapshot.symbol,
-                snapshot.window_seconds,
-            ).append(snapshot)
-        crosses: list[CrossVenueFeatureSnapshot] = []
-        for symbol in self._settings.markets.canonical_symbols:
-            for window_seconds in self._settings.timing.feature_windows_seconds:
-                candidates: list[FeatureSnapshot] = []
-                for exchange in (Exchange.BINANCE, Exchange.OKX):
-                    candidates.extend(
-                        self._history_for(exchange, symbol, window_seconds)
-                    )
-                crosses.append(
-                    self._cross_engine.calculate(
-                        candidates,
-                        symbol=symbol,
-                        decision_timestamp=tick.timestamp,
-                        window_seconds=window_seconds,
-                    )
-                )
-        self.calculation_latency.add(
-            (time.perf_counter() - calculation_started) * 1000.0
-        )
-
-        enqueue_started = time.perf_counter()
-        snapshots: Iterable[FeatureSnapshot | CrossVenueFeatureSnapshot] = chain(
-            singles,
-            crosses,
-        )
-        for output_snapshot in snapshots:
-            self._record_snapshot(output_snapshot)
-            await self._writer.write(output_snapshot)
-        self.enqueue_latency.add((time.perf_counter() - enqueue_started) * 1000.0)
-        self.single_snapshots += len(singles)
-        self.cross_snapshots += len(crosses)
+def _qualified_type(value: object) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
-class _ProcessMemoryCounters(ctypes.Structure):
-    _fields_ = [
-        ("cb", ctypes.c_ulong),
-        ("PageFaultCount", ctypes.c_ulong),
-        ("PeakWorkingSetSize", ctypes.c_size_t),
-        ("WorkingSetSize", ctypes.c_size_t),
-        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-        ("PagefileUsage", ctypes.c_size_t),
-        ("PeakPagefileUsage", ctypes.c_size_t),
-    ]
-
-
-def _current_rss_bytes() -> int:
-    if sys.platform == "win32":
-        counters = _ProcessMemoryCounters()
-        counters.cb = ctypes.sizeof(counters)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        psapi = ctypes.WinDLL("psapi", use_last_error=True)
-        get_current_process = kernel32.GetCurrentProcess
-        get_current_process.argtypes = []
-        get_current_process.restype = ctypes.c_void_p
-        get_process_memory_info = psapi.GetProcessMemoryInfo
-        get_process_memory_info.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(_ProcessMemoryCounters),
-            ctypes.c_ulong,
-        ]
-        get_process_memory_info.restype = ctypes.c_int
-        process = get_current_process()
-        success = get_process_memory_info(
-            process,
-            ctypes.byref(counters),
-            counters.cb,
-        )
-        if not success:
-            raise ctypes.WinError(ctypes.get_last_error())
-        return int(counters.WorkingSetSize)
-    statm = Path("/proc/self/statm")
-    if statm.is_file():
-        resident_pages = int(statm.read_text(encoding="ascii").split()[1])
-        return resident_pages * os.sysconf("SC_PAGE_SIZE")
-    raise RuntimeError("RSS sampling is unsupported on this platform")
+def _safety_boundary_evidence(
+    *,
+    components: Iterable[object],
+    output_event_type_counts: Mapping[str, int],
+) -> SafetyBoundaryEvidence:
+    component_types = tuple(sorted({_qualified_type(value) for value in components}))
+    output_counts = dict(sorted(output_event_type_counts.items()))
+    forbidden_outputs = sum(
+        count
+        for event_type, count in output_counts.items()
+        if event_type != "MARKET_FEATURE"
+    )
+    return SafetyBoundaryEvidence(
+        execution_mode="OFFLINE_FIXED_DATASET_REPLAY",
+        input_transport="LOCAL_PARQUET",
+        component_types=component_types,
+        component_graph_matches_expected=(
+            frozenset(component_types) == _EXPECTED_ACCEPTANCE_COMPONENT_TYPES
+        ),
+        output_event_type_counts=output_counts,
+        forbidden_output_events_observed=forbidden_outputs,
+        network_request_instrumentation_enabled=False,
+        claim_scope=(
+            "The recorded graph is local-Parquet, feature-only, and contains no "
+            "exchange connector, signal, execution, order, or account component. "
+            "Network requests are not instrumented, so this report does not present "
+            "a fabricated private-request counter."
+        ),
+    )
 
 
 async def _sample_rss(stop: asyncio.Event, samples: list[int]) -> None:
     while True:
-        samples.append(_current_rss_bytes())
+        samples.append(current_rss_bytes())
         if stop.is_set():
             return
         try:
             await asyncio.wait_for(stop.wait(), timeout=0.25)
         except TimeoutError:
             continue
-
-
-def _records_with_first_market_timestamp(
-    records: Iterable[RawMarketRecord],
-    order: ReplayOrder,
-) -> tuple[Iterable[RawMarketRecord], datetime]:
-    iterator = iter(records)
-    prefix: list[RawMarketRecord] = []
-    for record in iterator:
-        prefix.append(record)
-        if record.channel != "instrument_metadata":
-            return chain(prefix, iterator), replay_timestamp(record, order)
-    raise ValueError("fixed dataset contains no replayable market records")
 
 
 async def _run_once(
@@ -406,53 +227,54 @@ async def _run_once(
     batch_rows: int,
     writer_flush_seconds: float,
     replay_order: ReplayOrder,
+    replay_source_mode: ReplaySourceMode,
+    expected_normalized_event_count: int | None,
     on_replay_complete: Callable[[Phase3RunMetrics], None] | None = None,
 ) -> Phase3RunMetrics:
     if output_path.exists() and any(output_path.iterdir()):
         raise ValueError(f"acceptance output must be empty: {output_path}")
     reader = RawParquetReader(input_path)
     order = replay_order
-    records, first_timestamp = _records_with_first_market_timestamp(
-        reader.iter_records(order=order),
-        order,
+    if replay_source_mode is ReplaySourceMode.AUTO:
+        raise ValueError("Phase 3 replay source mode must be resolved before a run")
+    if replay_source_mode is ReplaySourceMode.JOURNAL:
+        filters = RawScanFilter(
+            channels=frozenset({NORMALIZED_EVENT_JOURNAL_CHANNEL})
+        )
+    else:
+        filters = RawScanFilter(
+            excluded_channels=frozenset({NORMALIZED_EVENT_JOURNAL_CHANNEL})
+        )
+    records = reader.iter_records(filters=filters, order=order)
+    runtime = FeatureRuntime(
+        settings,
+        output_path=output_path,
+        writer_batch_rows=batch_rows,
+        writer_flush_seconds=writer_flush_seconds,
     )
-    state = MarketStateStore(settings.features)
-    feature_state = FeatureStatePipeline(state)
-    observer = _EventObserver()
     bus = NormalizedEventBus(
         default_queue_capacity=settings.pipeline.consumer_queue_capacity
     )
-    async def consume_feature_state(event: NormalizedMarketEvent) -> None:
-        await feature_state.consume(event)
-        observer.observe(event)
-
     bus.register(
-        "feature-state",
-        consume_feature_state,
+        "feature-runtime",
+        runtime.consume_event,
         queue_capacity=settings.pipeline.consumer_queue_capacity,
     )
-    writer = AsyncFeatureParquetWriter(
-        root_path=output_path,
-        settings=settings,
-        batch_rows=batch_rows,
-        flush_seconds=writer_flush_seconds,
-        queue_capacity=settings.storage.feature_parquet_queue_capacity,
-        deduplication_capacity=settings.storage.feature_deduplication_capacity,
-    )
-    tick_sink = _FeatureTickSink(settings=settings, state=state, writer=writer)
-    scheduler = DecisionScheduler(
-        start=first_timestamp,
-        feature_interval=timedelta(seconds=settings.timing.feature_update_seconds),
-        signal_interval=timedelta(seconds=settings.timing.signal_check_seconds),
+    driver = ReceiveTimeFeatureDriver(
+        settings,
+        event_bus=bus,
+        runtime=runtime,
     )
     runner = ReplayRunner(
         event_bus=bus,
-        scheduler=scheduler,
-        tick_sink=tick_sink.consume,
+        event_sink=driver.publish,
+        finish_sink=lambda watermark: driver.finish(
+            through_timestamp=watermark
+        ),
         order=order,
         speed=0,
     )
-    rss_samples: list[int] = [_current_rss_bytes()]
+    rss_samples: list[int] = [current_rss_bytes()]
     stop_sampling = asyncio.Event()
     sampler = asyncio.create_task(
         _sample_rss(stop_sampling, rss_samples),
@@ -461,17 +283,37 @@ async def _run_once(
     wall_started = time.perf_counter()
     cpu_started = time.process_time()
     try:
-        await writer.start()
+        await runtime.start()
         try:
             replay = await runner.run(records)
+            if replay.raw_records == 0 or replay.normalized_events == 0:
+                raise RuntimeError(
+                    "Phase 3 replay requires nonempty raw and normalized input"
+                )
+            if (
+                replay_source_mode is ReplaySourceMode.JOURNAL
+                and replay.feature_timeline_end_records != 1
+            ):
+                raise RuntimeError(
+                    "Phase 3 journal replay requires exactly one clean "
+                    "feature-timeline end marker"
+                )
+            if (
+                expected_normalized_event_count is not None
+                and replay.normalized_events != expected_normalized_event_count
+            ):
+                raise RuntimeError(
+                    "Phase 3 journal replay count diverged from its "
+                    "validated collection manifest"
+                )
         finally:
-            await writer.close()
+            await runtime.close()
     finally:
         stop_sampling.set()
         await sampler
     wall_duration = time.perf_counter() - wall_started
     cpu_duration = time.process_time() - cpu_started
-    rss_samples.append(_current_rss_bytes())
+    rss_samples.append(current_rss_bytes())
     event_span = (
         None
         if replay.started_at is None or replay.finished_at is None
@@ -498,14 +340,28 @@ async def _run_once(
             0.0 if wall_duration == 0 else cpu_duration / wall_duration * 100.0
         ),
     )
+    safety_evidence = _safety_boundary_evidence(
+        components=(
+            reader,
+            runtime,
+            runtime.state,
+            runtime.feature_state,
+            bus,
+            runtime.writer,
+            driver,
+            runner,
+        ),
+        output_event_type_counts=runtime.stats.output_event_type_counts,
+    )
+    runtime_stats = runtime.stats
     replay_metrics = Phase3RunMetrics(
         label=label,
         input_path=input_path.resolve(),
         output_path=output_path.resolve(),
         replay=replay,
-        feature_state=feature_state.stats,
+        feature_state=runtime_stats.feature_state,
         consumers=bus.stats,
-        writer=writer.stats,
+        writer=runtime_stats.writer,
         feature_audit=FeatureAudit(
             rows=0,
             files=0,
@@ -521,23 +377,28 @@ async def _run_once(
             latest_decision_timestamp=None,
         ),
         resources=resources,
-        event_receive_latency=observer.receive_latency.metrics,
-        feature_calculation_latency=tick_sink.calculation_latency.metrics,
-        feature_enqueue_latency=tick_sink.enqueue_latency.metrics,
-        feature_ticks=tick_sink.feature_ticks,
-        signal_boundaries_observed=tick_sink.signal_boundaries,
-        single_venue_snapshots=tick_sink.single_snapshots,
-        cross_venue_snapshots=tick_sink.cross_snapshots,
-        unavailable_snapshots=tick_sink.unavailable_snapshots,
-        open_interest_stale_snapshots=tick_sink.open_interest_stale_snapshots,
-        non_aligned_cross_venue_snapshots=tick_sink.non_aligned_cross_snapshots,
-        unavailable_reason_counts=dict(sorted(tick_sink.unavailable_reasons.items())),
-        book_generation_rebuilds=observer.book_generation_rebuilds,
-        no_lookahead_violations=tick_sink.no_lookahead_violations,
-        signal_outputs=0,
-        order_outputs=0,
-        private_api_requests=0,
+        event_receive_latency=_latency_metrics(runtime_stats.receive_latency),
+        feature_calculation_latency=_latency_metrics(
+            runtime_stats.calculation_latency
+        ),
+        feature_enqueue_latency=_latency_metrics(runtime_stats.enqueue_latency),
+        feature_ticks=runtime_stats.feature_ticks,
+        signal_boundaries_observed=runtime_stats.reserved_signal_boundaries,
+        single_venue_snapshots=runtime_stats.single_venue_snapshots,
+        cross_venue_snapshots=runtime_stats.cross_venue_snapshots,
+        unavailable_snapshots=runtime_stats.unavailable_snapshots,
+        open_interest_stale_snapshots=(
+            runtime_stats.open_interest_stale_snapshots
+        ),
+        non_aligned_cross_venue_snapshots=(
+            runtime_stats.non_aligned_cross_venue_snapshots
+        ),
+        unavailable_reason_counts=runtime_stats.unavailable_reason_counts,
+        book_generation_rebuilds=runtime_stats.book_generation_rebuilds,
+        no_lookahead_violations=runtime_stats.no_lookahead_violations,
+        safety_evidence=safety_evidence,
         replay_order=order,
+        replay_source_mode=replay_source_mode,
         writer_batch_rows=batch_rows,
         writer_flush_seconds=writer_flush_seconds,
         throughput_records_per_second=throughput,
@@ -587,7 +448,7 @@ def _write_run_checkpoint(
     metrics: Phase3RunMetrics,
 ) -> None:
     checkpoint = _Phase3RunCheckpoint(
-        schema_version=1,
+        schema_version=3,
         stage=stage,
         package_source_sha256=package_source_sha256,
         settings_sha256=settings_fingerprint(settings),
@@ -612,9 +473,10 @@ async def _load_run_checkpoint(
     expected_batch_rows: int,
     expected_flush_seconds: float,
     expected_replay_order: ReplayOrder,
+    expected_replay_source_mode: ReplaySourceMode,
 ) -> Phase3RunMetrics:
     checkpoint = _RUN_CHECKPOINT_ADAPTER.validate_json(path.read_bytes())
-    if checkpoint.schema_version != 1:
+    if checkpoint.schema_version != 3:
         raise ValueError(f"unsupported Phase 3 checkpoint schema: {path}")
     if checkpoint.package_source_sha256 != package_source_sha256:
         raise ValueError(f"Phase 3 checkpoint code does not match current source: {path}")
@@ -628,6 +490,7 @@ async def _load_run_checkpoint(
         or metrics.writer_batch_rows != expected_batch_rows
         or metrics.writer_flush_seconds != expected_flush_seconds
         or metrics.replay_order is not expected_replay_order
+        or metrics.replay_source_mode is not expected_replay_source_mode
     ):
         raise ValueError(f"Phase 3 checkpoint run parameters do not match: {path}")
     current_audit = await asyncio.to_thread(
@@ -659,13 +522,15 @@ async def _run_or_resume(
     batch_rows: int,
     writer_flush_seconds: float,
     replay_order: ReplayOrder,
+    replay_source_mode: ReplaySourceMode,
+    expected_normalized_event_count: int | None,
     resume: bool,
     package_source_sha256: str,
 ) -> Phase3RunMetrics:
     output_path = destination / label
     checkpoint_path = destination / f"{label}-metrics.json"
     if resume and checkpoint_path.is_file():
-        return await _load_run_checkpoint(
+        checkpoint = await _load_run_checkpoint(
             checkpoint_path,
             settings=settings,
             package_source_sha256=package_source_sha256,
@@ -675,7 +540,18 @@ async def _run_or_resume(
             expected_batch_rows=batch_rows,
             expected_flush_seconds=writer_flush_seconds,
             expected_replay_order=replay_order,
+            expected_replay_source_mode=replay_source_mode,
         )
+        if (
+            expected_normalized_event_count is not None
+            and checkpoint.replay.normalized_events
+            != expected_normalized_event_count
+        ):
+            raise ValueError(
+                "Phase 3 checkpoint journal count does not match "
+                "the validated collection manifest"
+            )
+        return checkpoint
     if output_path.exists() and any(output_path.iterdir()):
         raise ValueError(
             f"partial Phase 3 output has no reusable checkpoint: {output_path}"
@@ -697,6 +573,8 @@ async def _run_or_resume(
         batch_rows=batch_rows,
         writer_flush_seconds=writer_flush_seconds,
         replay_order=replay_order,
+        replay_source_mode=replay_source_mode,
+        expected_normalized_event_count=expected_normalized_event_count,
         on_replay_complete=save_replay_checkpoint,
     )
     _write_run_checkpoint(
@@ -722,11 +600,12 @@ def _render_markdown(report: Phase3AcceptanceReport) -> str:
         first.cross_venue_snapshots,
     )
     lines = [
-        "# Phase 3 / v0.3.0 Acceptance Evidence",
+        f"# Phase 3 / v{__version__} Acceptance Evidence",
         "",
         f"- Generated: `{report.generated_at.astimezone(UTC).isoformat()}`",
         f"- Fixed input: `{report.input_path}`",
         f"- Replay order: `{first.replay_order.value}`",
+        f"- Replay source mode: `{first.replay_source_mode.value}`",
         (
             f"- Raw audit: {report.raw_audit.rows:,} rows, "
             f"{report.raw_audit.files:,} files, "
@@ -812,22 +691,43 @@ def _render_markdown(report: Phase3AcceptanceReport) -> str:
             "- Structured unavailable reasons: "
             f"`{json.dumps(first.unavailable_reason_counts, sort_keys=True)}`"
         ),
-        "- Trading signals emitted: `0`.",
-        "- Orders emitted: `0`.",
-        "- Private API requests: `0`.",
+        (
+            "- Observed persisted output event types: "
+            f"`{json.dumps(first.safety_evidence.output_event_type_counts, sort_keys=True)}`."
+        ),
+        (
+            "- Forbidden output events observed: "
+            f"`{first.safety_evidence.forbidden_output_events_observed}`."
+        ),
+        (
+            "- Feature-only runtime graph matched the fail-closed allowlist: "
+            f"`{first.safety_evidence.component_graph_matches_expected}`."
+        ),
+        (
+            "- Runtime component inventory: "
+            f"`{json.dumps(first.safety_evidence.component_types)}`."
+        ),
+        (
+            "- Safety evidence scope: "
+            f"{first.safety_evidence.claim_scope}"
+        ),
         "",
         "## Stability status",
         "",
         (
-            f"- Requested duration: {report.requested_stability_seconds:.0f} seconds "
-            f"({report.requested_stability_seconds / 3600:.2f} hours)."
+            "- Requested continuous-live stability duration: "
+            f"{report.requested_live_stability_seconds:.0f} seconds "
+            f"({report.requested_live_stability_seconds / 3600:.2f} hours)."
         ),
         (
-            f"- Actual wall-clock observation in this acceptance run: "
-            f"{report.actual_stability_observation_seconds:.3f} seconds."
+            "- Actual fixed-replay process observation in this acceptance run: "
+            f"{report.fixed_replay_observation_seconds:.3f} seconds."
         ),
-        f"- Full requested duration completed: `{report.full_stability_duration_completed}`.",
-        f"- Status: {report.full_stability_status}",
+        (
+            "- Continuous-live stability duration completed: "
+            f"`{report.live_stability_duration_completed}`."
+        ),
+        f"- Status: {report.live_stability_status}",
         "",
         "The feature Parquet trees are the authoritative all-field records. Their strict reader",
         "revalidated canonical payload JSON, payload SHA-256, schema, metadata, partitions,",
@@ -846,7 +746,8 @@ async def run_phase3_acceptance(
     second_batch_rows: int = 777,
     writer_flush_seconds: float = 60,
     replay_order: ReplayOrder = ReplayOrder.RECEIVE_TIME,
-    requested_stability_seconds: float = 6 * 60 * 60,
+    replay_source_mode: ReplaySourceMode = ReplaySourceMode.AUTO,
+    requested_live_stability_seconds: float = 6 * 60 * 60,
     resume: bool = False,
 ) -> Phase3AcceptanceReport:
     """Audit input, replay twice, compare exact feature content, and write evidence."""
@@ -855,8 +756,12 @@ async def run_phase3_acceptance(
         raise ValueError("acceptance writer batch sizes must be positive")
     if writer_flush_seconds <= 0:
         raise ValueError("acceptance writer flush interval must be positive")
-    if requested_stability_seconds <= 0:
-        raise ValueError("requested stability duration must be positive")
+    if requested_live_stability_seconds <= 0:
+        raise ValueError("requested live stability duration must be positive")
+    if replay_order is not ReplayOrder.RECEIVE_TIME:
+        raise ValueError(
+            "Phase 3 acceptance requires receive-time order to match live boundaries"
+        )
     source = input_path.resolve()
     destination = output_path.resolve()
     if not source.is_dir():
@@ -865,10 +770,54 @@ async def run_phase3_acceptance(
         raise ValueError("acceptance input and output must be disjoint")
     if not resume and destination.exists() and any(destination.iterdir()):
         raise ValueError("acceptance output directory must be empty")
-    destination.mkdir(parents=True, exist_ok=True)
-
-    raw_audit = await asyncio.to_thread(audit_raw_tree, source)
+    source_resolution = await asyncio.to_thread(
+        resolve_replay_source,
+        source,
+        replay_source_mode,
+    )
+    resolved_source_mode = source_resolution.mode
+    clean_collection = source_resolution.clean_collection
+    raw_audit = (
+        await asyncio.to_thread(audit_raw_tree, source)
+        if clean_collection is None
+        else clean_collection.raw_audit
+    )
+    expected_normalized_event_count = (
+        None
+        if clean_collection is None
+        else clean_collection.normalized_event_count
+    )
     package_source_sha256 = _package_source_sha256()
+    if clean_collection is not None:
+        capture_manifest = clean_collection.manifest
+        expected_settings_sha256 = settings_fingerprint(settings)
+        lineage_mismatches = [
+            label
+            for label, matches in (
+                ("code_version", capture_manifest.code_version == __version__),
+                (
+                    "code_sha256",
+                    capture_manifest.code_sha256 == package_source_sha256,
+                ),
+                (
+                    "strategy_version",
+                    capture_manifest.strategy_version
+                    == settings.app.strategy_version,
+                ),
+                (
+                    "settings_sha256",
+                    capture_manifest.settings_sha256
+                    == expected_settings_sha256,
+                ),
+            )
+            if not matches
+        ]
+        if lineage_mismatches:
+            raise RuntimeError(
+                "journal capture lineage differs from the acceptance runtime: "
+                + ", ".join(lineage_mismatches)
+            )
+    destination.mkdir(parents=True, exist_ok=True)
     first = await _run_or_resume(
         label="run-1",
         settings=settings,
@@ -877,6 +826,8 @@ async def run_phase3_acceptance(
         batch_rows=first_batch_rows,
         writer_flush_seconds=writer_flush_seconds,
         replay_order=replay_order,
+        replay_source_mode=resolved_source_mode,
+        expected_normalized_event_count=expected_normalized_event_count,
         resume=resume,
         package_source_sha256=package_source_sha256,
     )
@@ -888,6 +839,8 @@ async def run_phase3_acceptance(
         batch_rows=second_batch_rows,
         writer_flush_seconds=writer_flush_seconds,
         replay_order=replay_order,
+        replay_source_mode=resolved_source_mode,
+        expected_normalized_event_count=expected_normalized_event_count,
         resume=resume,
         package_source_sha256=package_source_sha256,
     )
@@ -922,9 +875,8 @@ async def run_phase3_acceptance(
         for run in (first, second)
     )
     safety = all(
-        run.signal_outputs == 0
-        and run.order_outputs == 0
-        and run.private_api_requests == 0
+        run.safety_evidence.component_graph_matches_expected
+        and run.safety_evidence.forbidden_output_events_observed == 0
         and all(stats.last_error is None for stats in run.consumers.values())
         and run.writer.last_error is None
         for run in (first, second)
@@ -933,9 +885,8 @@ async def run_phase3_acceptance(
         first.resources.wall_duration_seconds
         + second.resources.wall_duration_seconds
     )
-    full_stability = observed >= requested_stability_seconds
     report = Phase3AcceptanceReport(
-        schema_version=1,
+        schema_version=3,
         generated_at=datetime.now(tz=UTC),
         input_path=source,
         output_path=destination,
@@ -949,16 +900,12 @@ async def run_phase3_acceptance(
         throughput_above_realtime=above_realtime,
         feature_files_audited=feature_files_audited,
         safety_boundary_preserved=safety,
-        requested_stability_seconds=requested_stability_seconds,
-        actual_stability_observation_seconds=observed,
-        full_stability_duration_completed=full_stability,
-        full_stability_status=(
-            "completed"
-            if full_stability
-            else (
-                "pending: the repeatable harness was run on the longest retained "
-                "dataset, but this environment did not remain active for the full target"
-            )
+        requested_live_stability_seconds=requested_live_stability_seconds,
+        fixed_replay_observation_seconds=observed,
+        live_stability_duration_completed=False,
+        live_stability_status=(
+            "pending: a continuous live public-feed soak with reconnect and "
+            "resynchronization opportunities has not been executed"
         ),
     )
     if not deterministic:

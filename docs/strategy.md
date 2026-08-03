@@ -3,7 +3,10 @@
 ## 1. Research status
 
 All weights and thresholds are initial research hypotheses, not evidence of profitability.
-Phase 3B calculates single-venue observations but does not calculate market scores or signals.
+Phase 3 calculates single-venue and cross-venue observations but does not calculate market
+scores, signals, simulated fills, positions, or risk actions. Sections 5–10 below are an
+explicit Phase 4–6 design proposal, not a description of executable code in the current
+release.
 Evaluation must include fees, depth-based slippage, funding, latency, data gaps, and regime
 segmentation before any parameter is considered useful.
 
@@ -14,9 +17,9 @@ segmentation before any parameter is considered useful.
 - Canonical form: `BTC-USDT-PERP`, `ETH-USDT-PERP`.
 - Raw cadence: roughly 100 ms–1 s, channel dependent.
 - Features: every second over 5 s, 15 s, and 60 s windows.
-- Signal decision: every 5 s.
-- Intended holding: 3–30 minutes; hard maximum 30 minutes.
-- At most one paper position across all symbols and venues.
+- Planned Phase 4 signal decision: every 5 s.
+- Planned holding horizon: 3–30 minutes; proposed hard maximum 30 minutes.
+- Planned Phase 5 constraint: at most one paper position across all symbols and venues.
 
 ## 3. Input features
 
@@ -80,16 +83,20 @@ liquidations.
 Aligned snapshots produce:
 
 - mid-price spread, percentage spread, and trailing Z-score;
-- lead/lag evidence using exchange timestamps plus measured clock/receive behavior;
+- research-only lead/lag fields that currently remain explicitly unavailable;
 - agreement of taker flow, OFI, price impulse, and OI context;
 - a confirmation score and divergence penalty.
 
 No venue is called the leader solely because its packet reached this process first. If time
-alignment is ambiguous, confidence falls or the decision becomes `NO_TRADE`.
+alignment is ambiguous, the Phase 3 observation is marked unavailable with structured reasons.
+A future Phase 4 state machine may map those reasons to `NO_TRADE`.
 
-## 5. Scores
+## 5. Planned Phase 4 scores (not implemented)
 
-Per venue:
+The following is a research proposal for Phase 4A/4B. No current runtime computes these scores
+or applies the thresholds.
+
+Proposed per-venue formula:
 
 ```text
 exchange_score =
@@ -113,21 +120,22 @@ combined_score =
   - divergence_penalty
 ```
 
-Candidate long requires `combined_score > 1.8`; candidate short requires
-`combined_score < -1.8`. Values between those thresholds are neutral and cannot enter.
+One proposed rule would require `combined_score > 1.8` for a long candidate and
+`combined_score < -1.8` for a short candidate. Those values are unvalidated hypotheses, not
+active decision thresholds.
 
-All coefficients and limits come from configuration.
+If implemented, all coefficients and limits must come from configuration.
 
-## 6. Entry state machine
+## 6. Planned Phase 4 entry state machine (not implemented)
 
-The state machine emits exactly one of:
+The proposed state machine would emit exactly one of:
 
 `LONG_ENTRY`, `SHORT_ENTRY`, `LONG_EXIT`, `SHORT_EXIT`, `HOLD`, `NO_TRADE`,
 `EMERGENCY_EXIT`.
 
 ### 6.1 Long candidate
 
-Required conditions:
+Proposed research conditions:
 
 1. positive 15 s impulse on both venues;
 2. 15 s taker imbalance above `0.12` on both;
@@ -142,13 +150,14 @@ Required conditions:
 
 ### 6.2 Short candidate
 
-The directional flow, OFI, impulse, and breakout tests are symmetric. OI confirmation remains
-positive because increasing OI with falling price/negative flow can represent new shorts.
-Combined score must be below `-1.8`.
+The proposed directional flow, OFI, impulse, and breakout tests are symmetric. OI confirmation
+would remain positive because increasing OI with falling price/negative flow can represent new
+shorts. The proposed combined-score threshold is `-1.8`.
 
 ### 6.3 Blocking conditions
 
-Any blocking condition produces `NO_TRADE`, with structured reason codes:
+A future state machine would map any blocking condition to `NO_TRADE`, with structured reason
+codes:
 
 - venue direction conflict or neutral combined score;
 - recent move beyond `1.5 ATR`;
@@ -161,11 +170,12 @@ Any blocking condition produces `NO_TRADE`, with structured reason codes:
 - an existing position;
 - daily trade/loss or consecutive-loss lock.
 
-Signals include the feature snapshot ID and expiration time so stale decisions cannot execute.
+Future signals must include the feature snapshot ID and expiration time so stale decisions
+cannot execute.
 
-## 7. Venue selection and simulated fills
+## 7. Planned Phase 5 venue selection and simulated fills (not implemented)
 
-For each candidate:
+The proposed cost model for each candidate is:
 
 ```text
 execution_cost =
@@ -176,23 +186,24 @@ execution_cost =
   + depth_penalty
 ```
 
-Only a healthy venue may be selected. The paper fill walks up to the configured book depth to
-calculate volume-weighted price. A missing depth estimate blocks entry or uses an explicitly
-configured conservative fallback; it never assumes a mid-price fill.
+If implemented, only a healthy venue may be selected. A paper fill would walk up to the
+configured book depth to calculate volume-weighted price. A missing depth estimate must block
+entry or use an explicitly configured conservative fallback; it must never assume a mid-price
+fill.
 
-## 8. Position sizing and risk
+## 8. Planned Phase 5 position sizing and risk (not implemented)
 
-Default equity is 10,000 USDT. Risk per trade is 0.2%:
+The proposed research defaults are 10,000 USDT equity and 0.2% risk per trade:
 
 ```text
 quantity = equity * risk_fraction / abs(entry_price - stop_price)
 ```
 
-Quantity is capped so notional leverage does not exceed 2x. Daily loss is capped at 1%, daily
-trades at 10, and three consecutive losses block further entries for that trading day. There
-is no loss adding, martingale, duplicate same-direction venue position, or stop widening.
+If implemented, quantity would be capped so notional leverage does not exceed 2x. The proposed
+limits are 1% daily loss, 10 daily trades, and a three-consecutive-loss lock. Loss adding,
+martingale, duplicate same-direction venue positions, and stop widening must remain prohibited.
 
-## 9. Exit policy
+## 9. Planned Phase 5 exit policy (not implemented)
 
 - initial stop: `0.55 * 1-minute ATR`;
 - TP1: `0.8 ATR`, close 50%;
@@ -203,14 +214,15 @@ is no loss adding, martingale, duplicate same-direction venue position, or stop 
 - hard exit at 30 minutes;
 - `EMERGENCY_EXIT` on severe liquidity/data failure using conservative simulated pricing.
 
-Funding, fees, slippage, realized/unrealized PnL, equity, drawdown, and win/loss streaks are
-accounted explicitly.
+Any future simulator must account explicitly for funding, fees, slippage,
+realized/unrealized PnL, equity, drawdown, and win/loss streaks.
 
-## 10. Evaluation discipline
+## 10. Planned Phase 6 evaluation discipline (not implemented)
 
-Live and replay modes use the same feature and signal classes. Deterministic replay must
-produce identical signals/trades from identical input, configuration, code version, and seed.
-Reports include trade counts, win/loss distribution, profit factor, drawdown, Sharpe, Sortino,
+Phase 3 live and replay modes must use the same feature runtime. Future signal and paper-trading
+implementations must likewise share classes, and deterministic replay must produce identical
+signals/trades from identical input, configuration, code version, and seed. Future reports
+must include trade counts, win/loss distribution, profit factor, drawdown, Sharpe, Sortino,
 cost components, holding time, venue/symbol/regime breakdown, and parameter sensitivity.
 
 Parameter selection must use train/validation/test time splits and include an embargo where

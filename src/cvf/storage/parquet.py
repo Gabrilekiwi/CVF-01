@@ -18,6 +18,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from cvf.storage.raw import RawMarketRecord
+from cvf.utils.async_lifecycle import await_task_completion
 
 _STOP: Final = object()
 
@@ -59,6 +60,12 @@ class ParquetWriterStats:
     queue_depth: int
     last_file: Path | None
     last_error: str | None
+
+
+@dataclass(slots=True)
+class _RawSubmission:
+    record: RawMarketRecord
+    enqueued: bool = False
 
 
 def _partition_value(value: str) -> str:
@@ -150,11 +157,12 @@ class AsyncPartitionedParquetWriter:
         self._root_path = root_path
         self._batch_rows = batch_rows
         self._flush_seconds = flush_seconds
-        self._queue: asyncio.Queue[RawMarketRecord | object] = asyncio.Queue(
+        self._queue: asyncio.Queue[_RawSubmission | object] = asyncio.Queue(
             maxsize=queue_capacity
         )
         self._on_backpressure = on_backpressure
         self._task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._closed = False
         self._accepted_records = 0
         self._written_records = 0
@@ -192,6 +200,8 @@ class AsyncPartitionedParquetWriter:
     async def start(self) -> None:
         if self._closed:
             raise ParquetWriterError("cannot restart a closed Parquet writer")
+        if self._close_task is not None:
+            raise ParquetWriterError("cannot start a closing Parquet writer")
         if self._task is None:
             self._root_path.mkdir(parents=True, exist_ok=True)
             self._task = asyncio.create_task(self._run(), name="raw-parquet-writer")
@@ -199,36 +209,57 @@ class AsyncPartitionedParquetWriter:
     def _raise_worker_failure(self) -> None:
         if self._task is None or not self._task.done():
             return
+        if self._task.cancelled():
+            raise ParquetWriterError("Parquet worker task was cancelled")
         error = self._task.exception()
         if error is not None:
             raise ParquetWriterError(f"Parquet worker failed: {error}") from error
 
-    async def _put_or_worker_failure(self, item: RawMarketRecord | object) -> None:
+    async def _put_or_worker_failure(self, item: _RawSubmission | object) -> None:
         worker = self._task
         if worker is None:
             raise ParquetWriterError("Parquet writer is not running")
         if not self._queue.full():
             self._queue.put_nowait(item)
+            if isinstance(item, _RawSubmission):
+                item.enqueued = True
             return
         putter = asyncio.create_task(self._queue.put(item))
-        done, _ = await asyncio.wait(
-            {putter, worker},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        try:
+            done, _ = await asyncio.wait(
+                {putter, worker},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            if not putter.done():
+                putter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await putter
+            elif not putter.cancelled() and putter.exception() is None:
+                if isinstance(item, _RawSubmission):
+                    item.enqueued = True
+            raise
         if worker in done:
             if not putter.done():
                 putter.cancel()
                 with suppress(asyncio.CancelledError):
                     await putter
+            elif not putter.cancelled() and putter.exception() is None:
+                if isinstance(item, _RawSubmission):
+                    item.enqueued = True
             self._raise_worker_failure()
             if item is _STOP and not putter.cancelled() and putter.exception() is None:
                 return
             raise ParquetWriterError("Parquet worker stopped unexpectedly")
         await putter
+        if isinstance(item, _RawSubmission):
+            item.enqueued = True
 
     async def write(self, record: RawMarketRecord) -> None:
         if self._closed:
             raise ParquetWriterError("cannot write after close")
+        if self._close_task is not None:
+            raise ParquetWriterError("cannot write after close begins")
         if self._task is None:
             raise ParquetWriterError("start the Parquet writer before writing")
         self._raise_worker_failure()
@@ -236,21 +267,39 @@ class AsyncPartitionedParquetWriter:
             self._backpressure_events += 1
             if self._on_backpressure is not None:
                 self._on_backpressure(record)
-        await self._put_or_worker_failure(record)
+        submission = _RawSubmission(record)
+        try:
+            await self._put_or_worker_failure(submission)
+        except BaseException:
+            if submission.enqueued:
+                self._accepted_records += 1
+            raise
         self._accepted_records += 1
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        close_task = self._close_task
+        if close_task is None:
+            close_task = asyncio.create_task(
+                self._close_lifecycle(),
+                name="raw-parquet-writer-close",
+            )
+            self._close_task = close_task
+        await await_task_completion(close_task)
+
+    async def _close_lifecycle(self) -> None:
         if self._task is None:
+            self._closed = True
             return
-        self._raise_worker_failure()
-        await self._put_or_worker_failure(_STOP)
         try:
+            self._raise_worker_failure()
+            await self._put_or_worker_failure(_STOP)
             await self._task
+        except ParquetWriterError:
+            raise
         except Exception as exc:
             raise ParquetWriterError(f"Parquet worker failed: {exc}") from exc
+        finally:
+            self._closed = True
 
     async def _flush(self, records: list[RawMarketRecord]) -> None:
         if not records:
@@ -294,8 +343,8 @@ class AsyncPartitionedParquetWriter:
                 if item is _STOP:
                     await self._flush(batch)
                     return
-                assert isinstance(item, RawMarketRecord)
-                batch.append(item)
+                assert isinstance(item, _RawSubmission)
+                batch.append(item.record)
                 if len(batch) >= self._batch_rows:
                     await self._flush(batch)
                     batch.clear()

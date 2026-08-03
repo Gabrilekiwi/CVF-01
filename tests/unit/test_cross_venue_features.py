@@ -377,6 +377,65 @@ def test_cross_venue_spread_zscore_matches_hand_calculation() -> None:
     assert result.is_warm is True
 
 
+def test_spread_history_changes_id_and_persisted_history_lineage() -> None:
+    current = pair(binance={"mid": "104"}, okx={"mid": "100"})
+    first_history = [
+        *pair(
+            binance={"at": NOW - timedelta(seconds=2), "mid": "100"},
+            okx={"at": NOW - timedelta(seconds=2), "mid": "100"},
+        ),
+        *pair(
+            binance={"at": NOW - timedelta(seconds=1), "mid": "101"},
+            okx={"at": NOW - timedelta(seconds=1), "mid": "100"},
+        ),
+    ]
+    second_history = [
+        *pair(
+            binance={"at": NOW - timedelta(seconds=2), "mid": "99"},
+            okx={"at": NOW - timedelta(seconds=2), "mid": "100"},
+        ),
+        *pair(
+            binance={"at": NOW - timedelta(seconds=1), "mid": "102"},
+            okx={"at": NOW - timedelta(seconds=1), "mid": "100"},
+        ),
+    ]
+
+    first = calculate([*first_history, *current])
+    second = calculate([*second_history, *current])
+
+    assert first.price is not None
+    assert second.price is not None
+    assert (
+        first.price.mid_price_spread_zscore
+        != second.price.mid_price_spread_zscore
+    )
+    assert first.source_snapshot_ids == second.source_snapshot_ids
+    assert first.source_event_count == second.source_event_count == 2
+    assert first.spread_history_pair_count == second.spread_history_pair_count == 2
+    assert first.spread_history_sha256 != second.spread_history_sha256
+    assert first.feature_snapshot_id != second.feature_snapshot_id
+
+
+def test_zero_variance_cross_venue_zscore_is_unavailable_not_zero() -> None:
+    values = [
+        snapshot(Exchange.BINANCE, at=NOW - timedelta(seconds=2), mid="101"),
+        snapshot(Exchange.OKX, at=NOW - timedelta(seconds=2), mid="100"),
+        snapshot(Exchange.BINANCE, at=NOW - timedelta(seconds=1), mid="101"),
+        snapshot(Exchange.OKX, at=NOW - timedelta(seconds=1), mid="100"),
+        snapshot(Exchange.BINANCE, mid="101"),
+        snapshot(Exchange.OKX, mid="100"),
+    ]
+
+    result = calculate(values)
+
+    assert result.price is not None
+    assert result.price.mid_price_spread_zscore is None
+    assert result.is_warm is False
+    assert FeatureUnavailableCode.INSUFFICIENT_HISTORY in {
+        reason.code for reason in result.unavailable_reasons
+    }
+
+
 def test_zero_midpoint_denominator_is_explicitly_unavailable() -> None:
     result = calculate(pair(binance={"mid": "0"}, okx={"mid": "0"}))
 
@@ -386,6 +445,71 @@ def test_zero_midpoint_denominator_is_explicitly_unavailable() -> None:
     assert FeatureUnavailableCode.ZERO_DENOMINATOR in {
         reason.code for reason in result.unavailable_reasons
     }
+
+
+def test_cross_venue_difference_and_confirmation_formulas_match_reference() -> None:
+    result = calculate(
+        pair(
+            binance={
+                "price_return": 0.02,
+                "impulse": 2.0,
+                "volatility": 0.4,
+                "relative_spread": 0.003,
+                "taker": 0.5,
+                "ofi": 0.4,
+                "depth": 0.3,
+                "added": "12",
+                "removed": "5",
+                "recovery": 4.0,
+                "oi_change": 0.03,
+                "price_oi_state": PriceOpenInterestState.PRICE_UP_OI_UP,
+                "funding": "0.002",
+                "funding_zscore": 2.0,
+                "premium": 0.004,
+                "crowding": CrowdingState.CROWDED_LONG,
+                "liquidation_zscore": 5.0,
+            },
+            okx={
+                "price_return": -0.01,
+                "impulse": -1.0,
+                "volatility": 0.1,
+                "relative_spread": 0.001,
+                "taker": -0.25,
+                "ofi": -0.2,
+                "depth": -0.1,
+                "added": "7",
+                "removed": "9",
+                "recovery": 1.5,
+                "oi_change": -0.02,
+                "price_oi_state": PriceOpenInterestState.PRICE_DOWN_OI_UP,
+                "funding": "-0.001",
+                "funding_zscore": -1.0,
+                "premium": -0.002,
+                "crowding": CrowdingState.CROWDED_SHORT,
+                "liquidation_zscore": -5.0,
+            },
+        )
+    )
+
+    assert result.price is not None
+    assert result.order_flow is not None
+    assert result.positioning is not None
+    assert result.confirmation is not None
+    assert result.price.price_impulse_strength_difference == pytest.approx(3.0)
+    assert result.price.realized_volatility_difference == pytest.approx(0.3)
+    assert result.price.relative_spread_divergence == pytest.approx(0.002)
+    assert result.order_flow.taker_imbalance_difference == pytest.approx(0.75)
+    assert result.order_flow.ofi_difference == pytest.approx(0.6)
+    assert result.order_flow.depth_imbalance_difference == pytest.approx(0.4)
+    assert result.order_flow.liquidity_addition_difference == Decimal("5")
+    assert result.order_flow.liquidity_removal_difference == Decimal("-4")
+    assert result.order_flow.order_book_recovery_speed_difference == pytest.approx(
+        2.5
+    )
+    assert result.positioning.funding_abnormality_difference == pytest.approx(1.0)
+    assert result.positioning.mark_index_premium_difference == pytest.approx(0.006)
+    assert result.confirmation.cross_venue_confirmation == pytest.approx(-1.0)
+    assert result.confirmation.divergence_penalty_input == pytest.approx(1.0)
 
 
 def test_repeat_calculation_has_identical_id_and_payload() -> None:

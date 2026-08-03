@@ -435,7 +435,7 @@ class FeatureSnapshot(EventBase):
     source_event_count: int = Field(ge=0)
     oldest_source_timestamp: datetime | None = None
     newest_source_timestamp: datetime | None = None
-    data_age_ms: float = Field(ge=0)
+    data_age_ms: float | None = Field(default=None, ge=0)
     is_warm: bool
     is_healthy: bool
     unavailable_reasons: tuple[FeatureUnavailableReason, ...] = ()
@@ -460,6 +460,11 @@ class FeatureSnapshot(EventBase):
             raise ValueError("feature timestamps must be timezone-aware")
         return value.astimezone(UTC)
 
+    @field_validator("data_age_ms")
+    @classmethod
+    def finite_feature_data_age(cls, value: float | None) -> float | None:
+        return _finite(value)
+
     @model_validator(mode="after")
     def validate_snapshot_boundaries(self) -> FeatureSnapshot:
         if self.calculation_timestamp < self.decision_timestamp:
@@ -467,8 +472,12 @@ class FeatureSnapshot(EventBase):
         if self.source_event_count == 0:
             if self.oldest_source_timestamp is not None or self.newest_source_timestamp is not None:
                 raise ValueError("empty snapshots cannot claim source timestamp bounds")
+            if self.data_age_ms is not None:
+                raise ValueError("empty snapshots cannot fabricate a data age")
         elif self.oldest_source_timestamp is None or self.newest_source_timestamp is None:
             raise ValueError("nonempty snapshots require both source timestamp bounds")
+        elif self.data_age_ms is None:
+            raise ValueError("nonempty snapshots require a data age")
         if (
             self.oldest_source_timestamp is not None
             and self.newest_source_timestamp is not None
@@ -500,6 +509,11 @@ class CrossVenueFeatureSnapshot(EventBase):
     binance_book_generation: int | None = Field(default=None, ge=0)
     okx_book_generation: int | None = Field(default=None, ge=0)
     source_snapshot_ids: tuple[UUID, ...] = ()
+    spread_history_pair_count: int = Field(default=0, ge=0)
+    spread_history_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     source_event_count: int = Field(ge=0)
     oldest_source_timestamp: datetime | None = None
     newest_source_timestamp: datetime | None = None
@@ -554,11 +568,34 @@ class CrossVenueFeatureSnapshot(EventBase):
         )
         if self.source_snapshot_ids != expected_ids:
             raise ValueError("source_snapshot_ids must match the alignment result")
+        if self.spread_history_sha256 is None and self.spread_history_pair_count != 0:
+            raise ValueError(
+                "spread history count requires a deterministic history fingerprint"
+            )
+        if self.price is None:
+            if (
+                self.spread_history_pair_count != 0
+                or self.spread_history_sha256 is not None
+            ):
+                raise ValueError(
+                    "snapshots without price features cannot claim spread history"
+                )
+        elif (
+            self.price.mid_price_percentage_spread is not None
+            and self.spread_history_sha256 is None
+        ):
+            raise ValueError(
+                "evaluated spread z-score requires a deterministic history fingerprint"
+            )
         if self.source_event_count == 0:
             if self.oldest_source_timestamp is not None or self.newest_source_timestamp is not None:
                 raise ValueError("empty cross-venue snapshots cannot claim source bounds")
+            if self.data_age_ms is not None:
+                raise ValueError("empty cross-venue snapshots cannot fabricate a data age")
         elif self.oldest_source_timestamp is None or self.newest_source_timestamp is None:
             raise ValueError("nonempty cross-venue snapshots require source bounds")
+        elif self.data_age_ms is None:
+            raise ValueError("nonempty cross-venue snapshots require a data age")
         if (
             self.oldest_source_timestamp is not None
             and self.newest_source_timestamp is not None
@@ -581,6 +618,8 @@ class CrossVenueFeatureSnapshot(EventBase):
             raise ValueError("unavailable alignments cannot expose paired feature groups")
         if self.is_healthy and self.alignment.status is not AlignmentStatus.ALIGNED:
             raise ValueError("only aligned snapshots can be healthy")
+        if self.is_warm and self.is_healthy and self.unavailable_reasons:
+            raise ValueError("available cross-venue snapshots cannot have unavailable reasons")
         if (not self.is_warm or not self.is_healthy) and not self.unavailable_reasons:
             raise ValueError("unavailable cross-venue snapshots require structured reasons")
         return self

@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from cvf.storage.raw import RawMarketRecord
+from cvf.storage.raw import (
+    FEATURE_TIMELINE_END_MESSAGE_KIND,
+    RawMarketRecord,
+)
 
 
 class ReplayOrder(StrEnum):
@@ -25,8 +28,15 @@ def stable_record_key(
 ) -> tuple[int, datetime, datetime, int, str, str, str, str, str]:
     """Sort equal timestamps without relying on filesystem or task iteration order."""
 
+    record_priority = (
+        0
+        if record.channel == "instrument_metadata"
+        else 2
+        if record.message_kind == FEATURE_TIMELINE_END_MESSAGE_KIND
+        else 1
+    )
     return (
-        0 if record.channel == "instrument_metadata" else 1,
+        record_priority,
         replay_timestamp(record, order),
         record.local_receive_timestamp.astimezone(UTC),
         record.connection_generation,

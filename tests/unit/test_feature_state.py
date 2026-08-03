@@ -17,12 +17,14 @@ from cvf.features import (
     FeatureUnavailableReason,
     LateEventPolicy,
     MarketStateStore,
+    SingleVenueFeatureEngine,
     StateUpdateStatus,
     evaluate_availability,
 )
 from cvf.models import (
     AggressorSide,
     Exchange,
+    ExchangeHealth,
     HealthStatus,
     OpenInterest,
     OrderBookLevel,
@@ -32,6 +34,28 @@ from cvf.models import (
 )
 
 NOW = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
+
+
+def test_health_event_updates_deterministic_feature_state() -> None:
+    store = MarketStateStore(load_settings(environ={}).features)
+    event = ExchangeHealth(
+        exchange=Exchange.BINANCE,
+        symbol="BTC-USDT-PERP",
+        exchange_timestamp=NOW,
+        local_receive_timestamp=NOW,
+        normalization_timestamp=NOW,
+        channel="trades",
+        status=HealthStatus.STALE,
+        is_connected=True,
+    )
+
+    result = store.ingest(event)
+
+    assert result.status is StateUpdateStatus.ACCEPTED
+    assert (
+        store.state(Exchange.BINANCE, "BTC-USDT-PERP").health_by_channel["trades"]
+        is HealthStatus.STALE
+    )
 
 
 def trade(at: datetime, sequence: int = 1) -> Trade:
@@ -185,6 +209,222 @@ def test_book_buffers_until_snapshot_and_generation_change_restarts_warmup() -> 
     assert changed.status is StateUpdateStatus.BUFFERED_FOR_SNAPSHOT
     assert not state.order_book.view(depth=1).synchronized
     assert len(state.book_updates) == 0
+
+
+def test_book_epoch_advances_only_after_identified_resynchronization() -> None:
+    store = MarketStateStore(load_settings(environ={}).features)
+    assert (
+        store.ingest(snapshot(NOW, generation=1, sequence=100)).status
+        is StateUpdateStatus.ACCEPTED
+    )
+    state = store.state(Exchange.BINANCE, "BTC-USDT-PERP")
+    first = state.order_book.view(depth=1)
+
+    assert (
+        store.ingest(
+            snapshot(
+                NOW + timedelta(seconds=1),
+                generation=1,
+                sequence=101,
+            )
+        ).status
+        is StateUpdateStatus.ACCEPTED
+    )
+    periodic = state.order_book.view(depth=1)
+    assert periodic.epoch == first.epoch
+    assert periodic.synchronized_since == NOW
+    assert periodic.lineage.count == 2
+
+    assert (
+        store.ingest(
+            update(
+                NOW + timedelta(seconds=2),
+                generation=1,
+                sequence=103,
+                previous=999,
+            )
+        ).status
+        is StateUpdateStatus.BUFFERED_FOR_SNAPSHOT
+    )
+    assert not state.order_book.view(depth=1).synchronized
+    assert (
+        store.ingest(
+            snapshot(
+                NOW + timedelta(seconds=3),
+                generation=1,
+                sequence=104,
+            )
+        ).status
+        is StateUpdateStatus.ACCEPTED
+    )
+    recovered = state.order_book.view(depth=1)
+
+    assert recovered.epoch == first.epoch + 1
+    assert recovered.synchronized_since == NOW + timedelta(seconds=3)
+    assert recovered.lineage.count == 4
+
+
+def test_rejected_late_book_update_cannot_mutate_state_or_feature() -> None:
+    config = load_settings(environ={})
+    features = config.features.model_copy(
+        update={"late_event_policy": "drop"}
+    )
+    configured = config.model_copy(update={"features": features})
+    store = MarketStateStore(features)
+    assert (
+        store.ingest(snapshot(NOW, generation=1, sequence=100)).status
+        is StateUpdateStatus.ACCEPTED
+    )
+    assert (
+        store.ingest(
+            update(
+                NOW + timedelta(seconds=2),
+                generation=1,
+                sequence=101,
+                previous=100,
+            )
+        ).status
+        is StateUpdateStatus.ACCEPTED
+    )
+    state = store.state(Exchange.BINANCE, "BTC-USDT-PERP")
+    engine = SingleVenueFeatureEngine(configured)
+    decision = NOW + timedelta(seconds=2)
+    before_view = state.order_book.view(depth=1)
+    before_history = tuple(state.book_history)
+    before_feature = engine.calculate(
+        state,
+        decision_timestamp=decision,
+        window_seconds=5,
+    )
+
+    rejected = update(
+        NOW + timedelta(seconds=1),
+        generation=1,
+        sequence=102,
+        previous=101,
+    ).model_copy(
+        update={"local_receive_timestamp": NOW + timedelta(seconds=3)}
+    )
+    result = store.ingest(rejected)
+    after_feature = engine.calculate(
+        state,
+        decision_timestamp=decision,
+        window_seconds=5,
+    )
+
+    assert result.status is StateUpdateStatus.LATE_DROPPED
+    assert state.order_book.view(depth=1) == before_view
+    assert tuple(state.book_history) == before_history
+    assert after_feature == before_feature
+
+
+def test_insert_policy_never_retroactively_mutates_order_book() -> None:
+    config = load_settings(environ={})
+    features = config.features.model_copy(
+        update={
+            "late_event_policy": "insert",
+            "maximum_lateness_ms": 5_000,
+        }
+    )
+    store = MarketStateStore(features)
+    assert (
+        store.ingest(snapshot(NOW, generation=1, sequence=100)).status
+        is StateUpdateStatus.ACCEPTED
+    )
+    assert (
+        store.ingest(
+            update(
+                NOW + timedelta(seconds=2),
+                generation=1,
+                sequence=101,
+                previous=100,
+            )
+        ).status
+        is StateUpdateStatus.ACCEPTED
+    )
+    state = store.state(Exchange.BINANCE, "BTC-USDT-PERP")
+    before_view = state.order_book.view(depth=1)
+    before_updates = tuple(state.book_updates)
+    before_changes = tuple(state.book_changes)
+    before_history = tuple(state.book_history)
+
+    late = update(
+        NOW + timedelta(seconds=1),
+        generation=1,
+        sequence=102,
+        previous=101,
+    ).model_copy(
+        update={"local_receive_timestamp": NOW + timedelta(seconds=3)}
+    )
+    result = store.ingest(late)
+
+    assert result.status is StateUpdateStatus.LATE_DROPPED
+    assert state.order_book.view(depth=1) == before_view
+    assert tuple(state.book_updates) == before_updates
+    assert tuple(state.book_history) == before_history
+
+    late_snapshot = snapshot(
+        NOW + timedelta(seconds=1),
+        generation=1,
+        sequence=102,
+    ).model_copy(
+        update={"local_receive_timestamp": NOW + timedelta(seconds=4)}
+    )
+    snapshot_result = store.ingest(late_snapshot)
+
+    assert snapshot_result.status is StateUpdateStatus.LATE_DROPPED
+    assert state.order_book.view(depth=1) == before_view
+    assert tuple(state.book_updates) == before_updates
+    assert tuple(state.book_history) == before_history
+
+    for event_at, received_at in (
+        (
+            NOW + timedelta(seconds=2),
+            NOW + timedelta(seconds=5),
+        ),
+        (
+            NOW + timedelta(seconds=3),
+            NOW + timedelta(seconds=6),
+        ),
+    ):
+        stale_sequence_snapshot = snapshot(
+            event_at,
+            generation=1,
+            sequence=100,
+        ).model_copy(
+            update={"local_receive_timestamp": received_at}
+        )
+        stale_result = store.ingest(stale_sequence_snapshot)
+
+        assert stale_result.status is StateUpdateStatus.STALE_SEQUENCE
+        assert state.order_book.view(depth=1) == before_view
+        assert tuple(state.book_updates) == before_updates
+        assert tuple(state.book_history) == before_history
+
+    stale_generation_events = (
+        snapshot(
+            NOW + timedelta(seconds=4),
+            generation=0,
+            sequence=200,
+        ),
+        update(
+            NOW + timedelta(seconds=5),
+            generation=0,
+            sequence=201,
+            previous=200,
+        ),
+    )
+    for stale_generation_event in stale_generation_events:
+        stale_generation_result = store.ingest(stale_generation_event)
+
+        assert (
+            stale_generation_result.status
+            is StateUpdateStatus.STALE_GENERATION
+        )
+        assert state.order_book.view(depth=1) == before_view
+        assert tuple(state.book_updates) == before_updates
+        assert tuple(state.book_changes) == before_changes
+        assert tuple(state.book_history) == before_history
 
 
 def test_availability_distinguishes_missing_warmup_and_health() -> None:

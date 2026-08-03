@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import heapq
 import os
+import sqlite3
+import threading
 from collections import Counter, OrderedDict, defaultdict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Protocol, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -27,6 +30,7 @@ from cvf.features.models import (
     FeatureUnavailableCode,
 )
 from cvf.models.enums import EventType, Exchange
+from cvf.utils.async_lifecycle import await_task_completion
 from cvf.utils.fingerprint import (
     canonical_json,
     model_payload_json,
@@ -40,6 +44,21 @@ type PersistableFeatureSnapshot = FeatureSnapshot | CrossVenueFeatureSnapshot
 _STOP: Final = object()
 _DIGEST_MODULUS = 1 << 256
 _SCHEMA_DIRECTORY = "feature_schema=v1"
+_INDEX_FILENAME = ".feature-deduplication-v1.sqlite3"
+_ROOT_CLAIM_FILENAME = ".feature-writer-v1.lock"
+_INDEX_TRANSACTION_ROWS = 1_000
+_IN_PROCESS_ROOT_CLAIMS: set[str] = set()
+_IN_PROCESS_ROOT_CLAIMS_LOCK = threading.Lock()
+_INDEX_SCHEMA_SQL = """
+CREATE TABLE feature_snapshot_index (
+    feature_snapshot_id TEXT PRIMARY KEY,
+    payload_sha256 TEXT NOT NULL,
+    code_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    persistence_state TEXT NOT NULL
+        CHECK (persistence_state IN ('PENDING', 'COMMITTED'))
+) WITHOUT ROWID
+"""
 
 FEATURE_PARQUET_SCHEMA = pa.schema(
     [
@@ -190,6 +209,16 @@ class _FeatureEnvelope:
     payload_json: str
     payload_sha256: str
 
+    @property
+    def content_identity(self) -> tuple[str, str, str]:
+        return (self.payload_sha256, self.code_version, self.config_hash)
+
+
+@dataclass(slots=True)
+class _FeatureSubmission:
+    envelope: _FeatureEnvelope
+    enqueued: bool = False
+
 
 def _utc(value: datetime | None) -> datetime | None:
     return None if value is None else value.astimezone(UTC)
@@ -206,11 +235,157 @@ def _native_path(path: Path) -> str:
     return resolved
 
 
+def _remove_sqlite_sidecars(path: Path) -> None:
+    """Remove disposable journal state before publishing a rebuilt main DB."""
+
+    for suffix in ("-journal", "-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if os.path.exists(_native_path(sidecar)):
+            os.unlink(_native_path(sidecar))
+
+
 def _schema_root(root: Path) -> Path:
     resolved = root.resolve()
     if resolved.name == _SCHEMA_DIRECTORY:
         return resolved
     return resolved / _SCHEMA_DIRECTORY
+
+
+def _index_path(root: Path) -> Path:
+    resolved = root.resolve()
+    base = resolved.parent if resolved.name == _SCHEMA_DIRECTORY else resolved
+    return base / _INDEX_FILENAME
+
+
+class _FcntlModule(Protocol):
+    LOCK_EX: int
+    LOCK_NB: int
+    LOCK_UN: int
+
+    def flock(self, descriptor: int, operation: int) -> None: ...
+
+
+def _lock_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        return
+
+    fcntl = cast(_FcntlModule, __import__("fcntl"))
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+
+    fcntl = cast(_FcntlModule, __import__("fcntl"))
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@dataclass(slots=True)
+class _FeatureRootClaim:
+    path: Path
+    key: str
+    descriptor: int | None
+
+    @classmethod
+    def acquire(cls, path: Path) -> _FeatureRootClaim:
+        resolved = path.resolve()
+        key = os.path.normcase(str(resolved))
+        with _IN_PROCESS_ROOT_CLAIMS_LOCK:
+            if key in _IN_PROCESS_ROOT_CLAIMS:
+                raise FeatureParquetError(
+                    f"feature dataset root is already claimed: {resolved.parent}"
+                )
+            _IN_PROCESS_ROOT_CLAIMS.add(key)
+
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                _native_path(resolved),
+                os.O_CREAT | os.O_RDWR,
+                0o600,
+            )
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _lock_descriptor(descriptor)
+        except OSError as exc:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            with _IN_PROCESS_ROOT_CLAIMS_LOCK:
+                _IN_PROCESS_ROOT_CLAIMS.discard(key)
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise FeatureParquetError(
+                    f"feature dataset root is already claimed: {resolved.parent}"
+                ) from exc
+            raise FeatureParquetError(
+                f"cannot claim feature dataset root {resolved.parent}: {exc}"
+            ) from exc
+        assert descriptor is not None
+        return cls(path=resolved, key=key, descriptor=descriptor)
+
+    def release(self) -> None:
+        descriptor = self.descriptor
+        if descriptor is None:
+            return
+        self.descriptor = None
+        try:
+            with suppress(OSError):
+                _unlock_descriptor(descriptor)
+        finally:
+            with suppress(OSError):
+                os.close(descriptor)
+            with _IN_PROCESS_ROOT_CLAIMS_LOCK:
+                _IN_PROCESS_ROOT_CLAIMS.discard(self.key)
+
+
+def _validate_feature_tree_layout(
+    root: Path,
+    *,
+    allow_uninitialized: bool,
+) -> tuple[Path, int]:
+    resolved = root.resolve()
+    schema_root = _schema_root(resolved)
+    if not resolved.exists():
+        if allow_uninitialized:
+            return schema_root, 0
+        raise ValueError(f"feature tree does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"feature tree root is not a directory: {resolved}")
+    if not schema_root.exists():
+        if allow_uninitialized:
+            return schema_root, 0
+        raise ValueError(f"feature tree is missing {_SCHEMA_DIRECTORY}: {resolved}")
+    if not schema_root.is_dir():
+        raise ValueError(f"feature schema root is not a directory: {schema_root}")
+
+    scan_root = resolved
+    for candidate in scan_root.rglob("feature_schema=*"):
+        if candidate.is_dir() and candidate.resolve() != schema_root:
+            raise ValueError(f"unknown feature schema directory: {candidate}")
+
+    parquet_count = 0
+    for path in scan_root.rglob("*.parquet"):
+        resolved_path = path.resolve()
+        if not resolved_path.is_relative_to(schema_root):
+            raise ValueError(f"feature Parquet exists outside schema tree: {path}")
+        parquet_count += 1
+    if parquet_count == 0 and not allow_uninitialized:
+        raise ValueError(f"feature tree contains no Parquet data: {schema_root}")
+    return schema_root, parquet_count
+
+
+def _iter_schema_parquet_files(schema_root: Path) -> Iterator[Path]:
+    yield from schema_root.rglob("*.parquet")
 
 
 def _partition(
@@ -375,7 +550,7 @@ def _write_partition_file(
 
 
 class AsyncFeatureParquetWriter:
-    """Bounded writer with atomic files and bounded snapshot-ID deduplication."""
+    """Bounded writer with atomic files and restart-safe ID deduplication."""
 
     def __init__(
         self,
@@ -418,11 +593,14 @@ class AsyncFeatureParquetWriter:
             raise ValueError("feature queue_capacity must be positive")
         if self._deduplication_capacity < 1:
             raise ValueError("feature deduplication_capacity must be positive")
-        self._queue: asyncio.Queue[_FeatureEnvelope | object] = asyncio.Queue(
+        self._queue: asyncio.Queue[_FeatureSubmission | object] = asyncio.Queue(
             maxsize=capacity
         )
         self._on_backpressure = on_backpressure
         self._task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
         self._closed = False
         self._accepted = 0
         self._deduplicated = 0
@@ -438,7 +616,12 @@ class AsyncFeatureParquetWriter:
         self._maximum_write_latency_ms: float | None = None
         self._code_version = __version__
         self._config_hash = settings_fingerprint(settings)
-        self._deduplication: OrderedDict[UUID, str] = OrderedDict()
+        self._deduplication: OrderedDict[
+            UUID, tuple[str, str, str]
+        ] = OrderedDict()
+        self._index_path = _index_path(root_path)
+        self._index: sqlite3.Connection | None = None
+        self._root_claim: _FeatureRootClaim | None = None
 
     @property
     def stats(self) -> FeatureWriterStats:
@@ -481,45 +664,281 @@ class AsyncFeatureParquetWriter:
     async def start(self) -> None:
         if self._closed:
             raise FeatureParquetError("cannot restart a closed feature writer")
-        if self._task is None:
-            _schema_root(self._root_path).mkdir(parents=True, exist_ok=True)
-            self._task = asyncio.create_task(
-                self._run(),
-                name="feature-parquet-writer",
+        if self._close_task is not None:
+            raise FeatureParquetError("cannot start a closing feature writer")
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise FeatureParquetError("cannot restart a closed feature writer")
+            if self._close_task is not None:
+                raise FeatureParquetError("cannot start a closing feature writer")
+            if self._task is not None:
+                return
+            try:
+                self._index_path.parent.mkdir(parents=True, exist_ok=True)
+                self._root_claim = _FeatureRootClaim.acquire(
+                    self._index_path.with_name(_ROOT_CLAIM_FILENAME)
+                )
+                _schema_root(self._root_path).mkdir(parents=True, exist_ok=True)
+                rebuild_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        _rebuild_feature_index,
+                        self._root_path,
+                        self._index_path,
+                    ),
+                    name="feature-deduplication-index-rebuild",
+                )
+                await await_task_completion(rebuild_task)
+                if self._close_task is not None:
+                    raise FeatureParquetError(
+                        "feature writer close began during startup"
+                    )
+                self._index = sqlite3.connect(
+                    _native_path(self._index_path),
+                    isolation_level=None,
+                    timeout=5.0,
+                )
+                # Parquet is authoritative and rebuilds this sidecar on start,
+                # but short WAL-backed transactions keep each in-process
+                # reservation/commit state internally consistent.
+                self._index.execute("PRAGMA journal_mode=WAL")
+                self._index.execute("PRAGMA synchronous=NORMAL")
+                self._task = asyncio.create_task(
+                    self._run(),
+                    name="feature-parquet-writer",
+                )
+            except asyncio.CancelledError:
+                try:
+                    self._close_index()
+                finally:
+                    self._release_root_claim()
+                raise
+            except Exception as exc:
+                try:
+                    self._close_index()
+                finally:
+                    self._release_root_claim()
+                raise FeatureParquetError(
+                    f"cannot initialize feature writer: {exc}"
+                ) from exc
+            except BaseException:
+                try:
+                    self._close_index()
+                finally:
+                    self._release_root_claim()
+                raise
+
+    def _require_index(self) -> sqlite3.Connection:
+        if self._index is None:
+            raise FeatureParquetError("feature deduplication index is not open")
+        return self._index
+
+    def _remember_identity(
+        self,
+        snapshot_id: UUID,
+        identity: tuple[str, str, str],
+    ) -> None:
+        self._deduplication[snapshot_id] = identity
+        self._deduplication.move_to_end(snapshot_id)
+        while len(self._deduplication) > self._deduplication_capacity:
+            self._deduplication.popitem(last=False)
+
+    def _reserve(
+        self,
+        envelope: _FeatureEnvelope,
+    ) -> bool:
+        snapshot_id = envelope.snapshot.feature_snapshot_id
+        identity = envelope.content_identity
+        existing = self._deduplication.get(snapshot_id)
+        if existing is None:
+            index = self._require_index()
+            index.execute("BEGIN IMMEDIATE")
+            try:
+                row = index.execute(
+                    """
+                    SELECT payload_sha256, code_version, config_hash
+                    FROM feature_snapshot_index
+                    WHERE feature_snapshot_id = ?
+                    """,
+                    (str(snapshot_id),),
+                ).fetchone()
+                if row is not None:
+                    existing = (str(row[0]), str(row[1]), str(row[2]))
+                if existing is None:
+                    index.execute(
+                        """
+                        INSERT INTO feature_snapshot_index (
+                            feature_snapshot_id,
+                            payload_sha256,
+                            code_version,
+                            config_hash,
+                            persistence_state
+                        ) VALUES (?, ?, ?, ?, 'PENDING')
+                        """,
+                        (str(snapshot_id), *identity),
+                    )
+            except BaseException:
+                index.rollback()
+                raise
+            else:
+                index.commit()
+        if existing is not None:
+            if existing != identity:
+                raise FeatureParquetError(
+                    "duplicate feature_snapshot_id has different content"
+                )
+            self._remember_identity(snapshot_id, identity)
+            return False
+        self._remember_identity(snapshot_id, identity)
+        return True
+
+    def _rollback_reservation(self, envelope: _FeatureEnvelope) -> None:
+        snapshot_id = envelope.snapshot.feature_snapshot_id
+        index = self._require_index()
+        index.execute("BEGIN IMMEDIATE")
+        try:
+            index.execute(
+                """
+                DELETE FROM feature_snapshot_index
+                WHERE feature_snapshot_id = ?
+                  AND persistence_state = 'PENDING'
+                """,
+                (str(snapshot_id),),
             )
+        except BaseException:
+            index.rollback()
+            raise
+        else:
+            index.commit()
+        if self._deduplication.get(snapshot_id) == envelope.content_identity:
+            del self._deduplication[snapshot_id]
+
+    def _mark_committed(self, envelopes: Sequence[_FeatureEnvelope]) -> None:
+        index = self._require_index()
+        for offset in range(0, len(envelopes), _INDEX_TRANSACTION_ROWS):
+            chunk = envelopes[offset : offset + _INDEX_TRANSACTION_ROWS]
+            index.execute("BEGIN IMMEDIATE")
+            try:
+                for envelope in chunk:
+                    cursor = index.execute(
+                        """
+                        UPDATE feature_snapshot_index
+                        SET persistence_state = 'COMMITTED'
+                        WHERE feature_snapshot_id = ?
+                          AND payload_sha256 = ?
+                          AND code_version = ?
+                          AND config_hash = ?
+                          AND persistence_state = 'PENDING'
+                        """,
+                        (
+                            str(envelope.snapshot.feature_snapshot_id),
+                            *envelope.content_identity,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise FeatureParquetError(
+                            "feature deduplication reservation disappeared before "
+                            "commit"
+                        )
+            except BaseException:
+                index.rollback()
+                raise
+            else:
+                index.commit()
+
+    def _rollback_all_pending(self) -> None:
+        index = self._index
+        if index is not None:
+            deleted = _INDEX_TRANSACTION_ROWS
+            while deleted == _INDEX_TRANSACTION_ROWS:
+                index.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = index.execute(
+                        """
+                        DELETE FROM feature_snapshot_index
+                        WHERE feature_snapshot_id IN (
+                            SELECT feature_snapshot_id
+                            FROM feature_snapshot_index
+                            WHERE persistence_state = 'PENDING'
+                            LIMIT ?
+                        )
+                        """,
+                        (_INDEX_TRANSACTION_ROWS,),
+                    )
+                    deleted = cursor.rowcount
+                except BaseException:
+                    index.rollback()
+                    raise
+                else:
+                    index.commit()
+
+    def _close_index(self) -> None:
+        index = self._index
+        self._index = None
+        if index is None:
+            return
+        try:
+            if index.in_transaction:
+                index.rollback()
+        finally:
+            index.close()
+
+    def _release_root_claim(self) -> None:
+        claim = self._root_claim
+        self._root_claim = None
+        if claim is not None:
+            claim.release()
 
     def _raise_worker_failure(self) -> None:
         if self._task is None or not self._task.done():
             return
+        if self._task.cancelled():
+            raise FeatureParquetError("feature writer task was cancelled")
         error = self._task.exception()
         if error is not None:
             raise FeatureParquetError(f"feature writer failed: {error}") from error
 
     async def _put_or_worker_failure(
         self,
-        item: _FeatureEnvelope | object,
+        item: _FeatureSubmission | object,
     ) -> None:
         worker = self._task
         if worker is None:
             raise FeatureParquetError("feature writer is not running")
         if not self._queue.full():
             self._queue.put_nowait(item)
+            if isinstance(item, _FeatureSubmission):
+                item.enqueued = True
             return
         putter = asyncio.create_task(self._queue.put(item))
-        done, _ = await asyncio.wait(
-            {putter, worker},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        try:
+            done, _ = await asyncio.wait(
+                {putter, worker},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            if not putter.done():
+                putter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await putter
+            elif not putter.cancelled() and putter.exception() is None:
+                if isinstance(item, _FeatureSubmission):
+                    item.enqueued = True
+            raise
         if worker in done:
             if not putter.done():
                 putter.cancel()
                 with suppress(asyncio.CancelledError):
                     await putter
+            elif not putter.cancelled() and putter.exception() is None:
+                if isinstance(item, _FeatureSubmission):
+                    item.enqueued = True
             self._raise_worker_failure()
             if item is _STOP and not putter.cancelled() and putter.exception() is None:
                 return
             raise FeatureParquetError("feature writer stopped unexpectedly")
         await putter
+        if isinstance(item, _FeatureSubmission):
+            item.enqueued = True
 
     def _envelope(
         self,
@@ -553,48 +972,85 @@ class AsyncFeatureParquetWriter:
     ) -> FeatureWriteStatus:
         if self._closed:
             raise FeatureParquetError("cannot write after close")
+        if self._close_task is not None:
+            raise FeatureParquetError("cannot write after close begins")
         if self._task is None:
             raise FeatureParquetError("start the feature writer before writing")
-        self._raise_worker_failure()
-        envelope = self._envelope(snapshot)
-        snapshot_id = snapshot.feature_snapshot_id
-        existing = self._deduplication.get(snapshot_id)
-        if existing is not None:
-            if existing != envelope.payload_sha256:
-                raise FeatureParquetError(
-                    "duplicate feature_snapshot_id has different content"
-                )
-            self._deduplication.move_to_end(snapshot_id)
-            self._deduplicated += 1
-            return FeatureWriteStatus.DEDUPLICATED
-        self._deduplication[snapshot_id] = envelope.payload_sha256
-        while len(self._deduplication) > self._deduplication_capacity:
-            self._deduplication.popitem(last=False)
-        if self._queue.full():
-            self._backpressure_events += 1
-            if self._on_backpressure is not None:
-                self._on_backpressure(snapshot)
-        try:
-            await self._put_or_worker_failure(envelope)
-        except Exception:
-            if self._deduplication.get(snapshot_id) == envelope.payload_sha256:
-                del self._deduplication[snapshot_id]
-            raise
-        self._accepted += 1
-        return FeatureWriteStatus.ACCEPTED
+        async with self._write_lock:
+            if self._closed:
+                raise FeatureParquetError("cannot write after close")
+            if self._close_task is not None:
+                raise FeatureParquetError("cannot write after close begins")
+            if self._task is None:
+                raise FeatureParquetError("feature writer is not running")
+            self._raise_worker_failure()
+            envelope = self._envelope(snapshot)
+            if not self._reserve(envelope):
+                self._deduplicated += 1
+                return FeatureWriteStatus.DEDUPLICATED
+            submission = _FeatureSubmission(envelope)
+            try:
+                if self._queue.full():
+                    self._backpressure_events += 1
+                    if self._on_backpressure is not None:
+                        try:
+                            self._on_backpressure(snapshot)
+                        except Exception as exc:
+                            raise FeatureParquetError(
+                                f"feature backpressure callback failed: {exc}"
+                            ) from exc
+                await self._put_or_worker_failure(submission)
+            except BaseException:
+                if submission.enqueued:
+                    self._accepted += 1
+                else:
+                    self._rollback_reservation(envelope)
+                raise
+            self._accepted += 1
+            return FeatureWriteStatus.ACCEPTED
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._task is None:
-            return
-        self._raise_worker_failure()
-        await self._put_or_worker_failure(_STOP)
-        try:
-            await self._task
-        except Exception as exc:
-            raise FeatureParquetError(f"feature writer failed: {exc}") from exc
+        close_task = self._close_task
+        if close_task is None:
+            close_task = asyncio.create_task(
+                self._close_lifecycle(),
+                name="feature-parquet-writer-close",
+            )
+            self._close_task = close_task
+        await await_task_completion(close_task)
+
+    async def _close_lifecycle(self) -> None:
+        async with self._lifecycle_lock, self._write_lock:
+            if self._task is None:
+                try:
+                    self._close_index()
+                finally:
+                    try:
+                        self._release_root_claim()
+                    finally:
+                        self._closed = True
+                return
+            try:
+                self._raise_worker_failure()
+                await self._put_or_worker_failure(_STOP)
+                await self._task
+            except FeatureParquetError:
+                raise
+            except Exception as exc:
+                raise FeatureParquetError(
+                    f"feature writer failed: {exc}"
+                ) from exc
+            finally:
+                try:
+                    self._rollback_all_pending()
+                finally:
+                    try:
+                        self._close_index()
+                    finally:
+                        try:
+                            self._release_root_claim()
+                        finally:
+                            self._closed = True
 
     async def _flush(self, envelopes: list[_FeatureEnvelope]) -> None:
         if not envelopes:
@@ -614,6 +1070,7 @@ class AsyncFeatureParquetWriter:
                 partition,
                 partition_envelopes,
             )
+            self._mark_committed(partition_envelopes)
             latency_ms = (asyncio.get_running_loop().time() - started) * 1000.0
             self._write_latency_total_ms += latency_ms
             self._write_latency_samples += 1
@@ -649,14 +1106,15 @@ class AsyncFeatureParquetWriter:
                 if item is _STOP:
                     await self._flush(batch)
                     return
-                assert isinstance(item, _FeatureEnvelope)
-                batch.append(item)
+                assert isinstance(item, _FeatureSubmission)
+                batch.append(item.envelope)
                 if len(batch) >= self._batch_rows:
                     await self._flush(batch)
                     batch.clear()
                     deadline = loop.time() + self._flush_seconds
-        except Exception as exc:
+        except BaseException as exc:
             self._last_error = f"{type(exc).__name__}: {exc}"
+            self._rollback_all_pending()
             raise
 
 
@@ -854,25 +1312,29 @@ class FeatureParquetReader:
         self,
         path: Path,
         filters: FeatureScanFilter,
-    ) -> Iterator[PersistedFeatureRecord]:
+    ) -> Generator[PersistedFeatureRecord, None, None]:
         parquet_file = pq.ParquetFile(_native_path(path))
-        if parquet_file.schema_arrow != FEATURE_PARQUET_SCHEMA:
-            raise ValueError(f"feature Parquet schema mismatch: {path}")
-        previous_key: tuple[object, ...] | None = None
-        for batch in parquet_file.iter_batches(batch_size=self.batch_size):
-            records = [
-                _record_from_row(row, path, self.schema_root)
-                for row in batch.to_pylist()
-            ]
-            for record in records:
-                key = _stable_key(record)
-                if previous_key is not None and key < previous_key:
-                    raise ValueError(
-                        f"feature Parquet file is not monotonically ordered: {path}"
-                    )
-                previous_key = key
-                if self._matches(record, filters):
-                    yield record
+        try:
+            if parquet_file.schema_arrow != FEATURE_PARQUET_SCHEMA:
+                raise ValueError(f"feature Parquet schema mismatch: {path}")
+            previous_key: tuple[object, ...] | None = None
+            for batch in parquet_file.iter_batches(batch_size=self.batch_size):
+                records = [
+                    _record_from_row(row, path, self.schema_root)
+                    for row in batch.to_pylist()
+                ]
+                for record in records:
+                    key = _stable_key(record)
+                    if previous_key is not None and key < previous_key:
+                        raise ValueError(
+                            "feature Parquet file is not monotonically "
+                            f"ordered: {path}"
+                        )
+                    previous_key = key
+                    if self._matches(record, filters):
+                        yield record
+        finally:
+            parquet_file.close()
 
     def iter_records(
         self,
@@ -880,7 +1342,22 @@ class FeatureParquetReader:
         filters: FeatureScanFilter | None = None,
     ) -> Iterator[PersistedFeatureRecord]:
         selected = filters or FeatureScanFilter()
-        files = sorted(self.schema_root.rglob("*.parquet"))
+        schema_root, _ = _validate_feature_tree_layout(
+            self.root_path,
+            allow_uninitialized=False,
+        )
+        files = sorted(_iter_schema_parquet_files(schema_root))
+        physical_rows = 0
+        for path in files:
+            parquet_file = pq.ParquetFile(_native_path(path))
+            try:
+                if parquet_file.schema_arrow != FEATURE_PARQUET_SCHEMA:
+                    raise ValueError(f"feature Parquet schema mismatch: {path}")
+                physical_rows += parquet_file.metadata.num_rows
+            finally:
+                parquet_file.close()
+        if physical_rows == 0:
+            raise ValueError(f"feature tree contains no feature rows: {schema_root}")
         iterators = [
             self._file_records(path, selected)
             for path in files
@@ -889,16 +1366,85 @@ class FeatureParquetReader:
 
         def checked() -> Iterator[PersistedFeatureRecord]:
             seen: set[UUID] = set()
-            for record in merged:
-                snapshot_id = record.feature_snapshot_id
-                if snapshot_id in seen:
-                    raise ValueError(
-                        f"duplicate persisted feature_snapshot_id: {snapshot_id}"
-                    )
-                seen.add(snapshot_id)
-                yield record
+            try:
+                for record in merged:
+                    snapshot_id = record.feature_snapshot_id
+                    if snapshot_id in seen:
+                        raise ValueError(
+                            "duplicate persisted feature_snapshot_id: "
+                            f"{snapshot_id}"
+                        )
+                    seen.add(snapshot_id)
+                    yield record
+            finally:
+                for iterator in iterators:
+                    iterator.close()
 
         return checked()
+
+
+def _rebuild_feature_index(root: Path, index_path: Path) -> None:
+    """Rebuild the disposable ID index from committed Parquet truth."""
+
+    schema_root, parquet_count = _validate_feature_tree_layout(
+        root,
+        allow_uninitialized=True,
+    )
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = index_path.with_name(f".{index_path.name}.{uuid4().hex}.tmp")
+    connection: sqlite3.Connection | None = None
+    rows = 0
+    try:
+        connection = sqlite3.connect(_native_path(temporary))
+        connection.execute(_INDEX_SCHEMA_SQL)
+        if parquet_count:
+            reader = FeatureParquetReader(root)
+            selected = FeatureScanFilter()
+            for path in _iter_schema_parquet_files(schema_root):
+                for record in reader._file_records(path, selected):
+                    try:
+                        connection.execute(
+                            """
+                            INSERT INTO feature_snapshot_index (
+                                feature_snapshot_id,
+                                payload_sha256,
+                                code_version,
+                                config_hash,
+                                persistence_state
+                            ) VALUES (?, ?, ?, ?, 'COMMITTED')
+                            """,
+                            (
+                                str(record.feature_snapshot_id),
+                                record.payload_sha256,
+                                record.code_version,
+                                record.config_hash,
+                            ),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        raise ValueError(
+                            "duplicate persisted feature_snapshot_id: "
+                            f"{record.feature_snapshot_id}"
+                        ) from exc
+                    rows += 1
+                    if rows % _INDEX_TRANSACTION_ROWS == 0:
+                        connection.commit()
+            if rows == 0:
+                raise ValueError(
+                    f"feature tree contains no feature rows: {schema_root}"
+                )
+        connection.commit()
+        connection.close()
+        connection = None
+        # The index is disposable Parquet-derived state. A crashed WAL from the
+        # prior main file must never be replayed over the newly rebuilt truth.
+        _remove_sqlite_sidecars(index_path)
+        os.replace(_native_path(temporary), _native_path(index_path))
+        _remove_sqlite_sidecars(index_path)
+    finally:
+        if connection is not None:
+            connection.close()
+        if os.path.exists(_native_path(temporary)):
+            os.unlink(_native_path(temporary))
 
 
 def audit_feature_tree(

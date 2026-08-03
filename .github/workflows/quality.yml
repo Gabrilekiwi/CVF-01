@@ -26,7 +26,9 @@ jobs:
       - name: Lint
         run: python -m ruff check .
       - name: Type check
-        run: python -m mypy src/cvf
+        # pytest above exercises the Linux fcntl path; type-check the guarded
+        # Windows msvcrt API explicitly because Linux typeshed omits its members.
+        run: python -m mypy --platform win32 src/cvf
       - name: Dependency check
         run: python -m pip check
       - name: Build wheel

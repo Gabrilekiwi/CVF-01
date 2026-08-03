@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +16,12 @@ from uuid import uuid4
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from cvf.storage.collection_manifest import (
+    compaction_in_progress_path,
+    inspect_collection_evidence,
+    preserve_clean_collection_manifest,
+    validate_clean_collection,
+)
 from cvf.storage.parquet import RAW_PARQUET_SCHEMA
 
 _MODULUS = 1 << 256
@@ -82,45 +90,96 @@ def _row_hash(row: dict[str, object]) -> int:
     return int.from_bytes(hashlib.sha256(encoded).digest(), "big")
 
 
+def _temporary_index_path() -> Path:
+    """Return a unique disk-backed audit index outside the read-only input tree."""
+
+    candidate = Path.cwd() / ".tmp"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        candidate = Path(tempfile.gettempdir())
+    return candidate / f"cvf-raw-audit-{uuid4().hex}.sqlite3"
+
+
+def _native_path(path: Path) -> str:
+    resolved = str(path.resolve())
+    if os.name == "nt" and not resolved.startswith("\\\\?\\"):
+        return f"\\\\?\\{resolved}"
+    return resolved
+
+
 def audit_raw_tree(root: Path) -> RawAudit:
     """Audit exact row identity/content without depending on file boundaries or row order."""
 
     resolved = root.resolve()
     files = sorted(resolved.rglob("*.parquet"))
-    record_ids: set[str] = set()
     digest_sum = 0
     rows = 0
     payload_bytes = 0
     partitions: set[tuple[str, str, str, str]] = set()
-    for path in files:
-        parquet_file = pq.ParquetFile(path)
-        if parquet_file.schema_arrow != RAW_PARQUET_SCHEMA:
-            raise ValueError(f"raw Parquet schema mismatch: {path}")
-        for batch in parquet_file.iter_batches(batch_size=65_536):
-            for row in batch.to_pylist():
-                if int(str(row["schema_version"])) != 1:
-                    raise ValueError(f"unsupported raw schema version in {path}")
-                record_id = str(row["record_id"])
-                if record_id in record_ids:
-                    raise ValueError(f"duplicate raw record_id: {record_id}")
-                if row["raw_payload_reference"] != f"raw://{record_id}":
-                    raise ValueError(f"raw payload lineage mismatch: {record_id}")
-                payload = bytes(row["raw_payload"])
-                if not payload:
-                    raise ValueError(f"empty raw payload: {record_id}")
-                partition = _row_partition(row)
-                expected = _partition_directory(resolved, partition)
-                if path.parent != expected:
-                    raise ValueError(f"row/partition mismatch: {path}")
-                partitions.add(partition)
-                record_ids.add(record_id)
-                payload_bytes += len(payload)
-                rows += 1
-                digest_sum = (digest_sum + _row_hash(row)) % _MODULUS
+    index_path = _temporary_index_path()
+    index: sqlite3.Connection | None = None
+    try:
+        index = sqlite3.connect(_native_path(index_path))
+        try:
+            index.execute("PRAGMA journal_mode=OFF")
+            index.execute("PRAGMA synchronous=OFF")
+            index.execute("PRAGMA temp_store=FILE")
+            index.execute(
+                "CREATE TABLE record_ids (record_id TEXT PRIMARY KEY) WITHOUT ROWID"
+            )
+            for path in files:
+                parquet_file = pq.ParquetFile(path)
+                try:
+                    if parquet_file.schema_arrow != RAW_PARQUET_SCHEMA:
+                        raise ValueError(f"raw Parquet schema mismatch: {path}")
+                    for batch in parquet_file.iter_batches(batch_size=65_536):
+                        batch_record_ids: list[str] = []
+                        for row in batch.to_pylist():
+                            if int(str(row["schema_version"])) != 1:
+                                raise ValueError(
+                                    f"unsupported raw schema version in {path}"
+                                )
+                            record_id = str(row["record_id"])
+                            if row["raw_payload_reference"] != f"raw://{record_id}":
+                                raise ValueError(
+                                    f"raw payload lineage mismatch: {record_id}"
+                                )
+                            payload = bytes(row["raw_payload"])
+                            if not payload:
+                                raise ValueError(f"empty raw payload: {record_id}")
+                            partition = _row_partition(row)
+                            expected = _partition_directory(resolved, partition)
+                            if path.parent != expected:
+                                raise ValueError(f"row/partition mismatch: {path}")
+                            partitions.add(partition)
+                            batch_record_ids.append(record_id)
+                            payload_bytes += len(payload)
+                            rows += 1
+                            digest_sum = (digest_sum + _row_hash(row)) % _MODULUS
+                        inserted_before = index.total_changes
+                        index.executemany(
+                            "INSERT OR IGNORE INTO record_ids (record_id) VALUES (?)",
+                            ((record_id,) for record_id in batch_record_ids),
+                        )
+                        inserted = index.total_changes - inserted_before
+                        if inserted != len(batch_record_ids):
+                            raise ValueError("duplicate raw record_id")
+                        index.commit()
+                finally:
+                    parquet_file.close()
+        finally:
+            index.close()
+            index = None
+    finally:
+        if index is not None:
+            index.close()
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            Path(f"{index_path}{suffix}").unlink(missing_ok=True)
     return RawAudit(
         rows=rows,
         files=len(files),
-        unique_record_ids=len(record_ids),
+        unique_record_ids=rows,
         content_digest=f"{digest_sum:064x}",
         payload_bytes=payload_bytes,
         partitions=len(partitions),
@@ -168,28 +227,46 @@ def compact_raw_tree(
         raise ValueError(f"raw input directory does not exist: {source}")
     if output.exists() and any(output.iterdir()):
         raise ValueError("compaction output directory must be empty")
-    before = audit_raw_tree(source)
+    evidence = inspect_collection_evidence(source)
+    clean_collection = (
+        validate_clean_collection(source)
+        if evidence.any
+        else None
+    )
+    before = (
+        audit_raw_tree(source)
+        if clean_collection is None
+        else clean_collection.raw_audit
+    )
     output.mkdir(parents=True, exist_ok=True)
+    sentinel = compaction_in_progress_path(output)
+    with sentinel.open("xb") as stream:
+        stream.write(f"source={source}\n".encode())
+        stream.flush()
+        os.fsync(stream.fileno())
 
     current_partition: tuple[str, str, str, str] | None = None
     buffer: list[dict[str, object]] = []
     for path in sorted(source.rglob("*.parquet")):
         parquet_file = pq.ParquetFile(path)
-        for batch in parquet_file.iter_batches(batch_size=target_rows):
-            for row in batch.to_pylist():
-                partition = _row_partition(row)
-                if (
-                    current_partition is not None
-                    and partition != current_partition
-                    and buffer
-                ):
-                    _write_rows(output, current_partition, buffer)
-                    buffer.clear()
-                current_partition = partition
-                buffer.append(row)
-                if len(buffer) >= target_rows:
-                    _write_rows(output, partition, buffer)
-                    buffer.clear()
+        try:
+            for batch in parquet_file.iter_batches(batch_size=target_rows):
+                for row in batch.to_pylist():
+                    partition = _row_partition(row)
+                    if (
+                        current_partition is not None
+                        and partition != current_partition
+                        and buffer
+                    ):
+                        _write_rows(output, current_partition, buffer)
+                        buffer.clear()
+                    current_partition = partition
+                    buffer.append(row)
+                    if len(buffer) >= target_rows:
+                        _write_rows(output, partition, buffer)
+                        buffer.clear()
+        finally:
+            parquet_file.close()
     if current_partition is not None and buffer:
         _write_rows(output, current_partition, buffer)
 
@@ -202,6 +279,16 @@ def compact_raw_tree(
         or before.partitions != after.partitions
     ):
         raise RuntimeError("raw compaction audit mismatch")
+    if clean_collection is not None:
+        preserve_clean_collection_manifest(
+            output,
+            manifest=clean_collection.manifest,
+            raw_audit=after,
+        )
+        sentinel.unlink()
+        validate_clean_collection(output, raw_audit=after)
+    else:
+        sentinel.unlink()
     return CompactionReport(
         input_path=source,
         output_path=output,

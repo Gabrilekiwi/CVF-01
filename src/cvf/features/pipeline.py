@@ -34,7 +34,7 @@ class FeatureStatePipeline:
             rejected_events=self._rejected,
             status_counts=dict(self._status_counts),
             state_count=len(self.store.states),
-            retained_items=sum(state.total_items() for state in self.store.states),
+            retained_items=self.store.retained_items,
         )
 
     async def consume(self, event: NormalizedMarketEvent) -> None:

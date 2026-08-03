@@ -17,20 +17,34 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
+from cvf import __version__
 from cvf.config import ConfigError, Settings, load_settings
 from cvf.exchanges.base import ExchangeConnector
 from cvf.exchanges.binance import BinanceMarketDataConnector
 from cvf.exchanges.okx import OKXMarketDataConnector
 from cvf.features.models import FeatureUnavailableCode
+from cvf.features.runtime import FeatureRuntime, ReceiveTimeFeatureDriver
 from cvf.logging_config import configure_logging
 from cvf.models.enums import Exchange
-from cvf.replay import RawParquetReader, RawScanFilter, ReplayOrder, ReplayRunner
+from cvf.replay import (
+    RawParquetReader,
+    RawScanFilter,
+    ReplayOrder,
+    ReplayRunner,
+    ReplayRuntimeLineage,
+    ReplaySourceMode,
+    resolve_replay_source,
+    validate_replay_capture_lineage,
+)
+from cvf.storage.collection_manifest import package_source_sha256
 from cvf.storage.compact import compact_raw_tree
 from cvf.storage.features import (
     FeatureScanFilter,
     audit_feature_tree,
     compare_feature_trees,
 )
+from cvf.storage.raw import NORMALIZED_EVENT_JOURNAL_CHANNEL
+from cvf.utils.fingerprint import settings_fingerprint
 
 
 def build_connectors(settings: Settings) -> list[ExchangeConnector]:
@@ -159,6 +173,7 @@ async def run_collection(
     *,
     duration_seconds: float | None,
     output_path: Path | None,
+    feature_output_path: Path | None,
 ) -> int:
     """Run explicit public collection until duration or shutdown signal."""
 
@@ -167,7 +182,16 @@ async def run_collection(
     logger = logging.getLogger("cvf")
     stop_event = asyncio.Event()
     restore_handlers = _install_shutdown_handlers(stop_event, logger)
-    collector = MarketDataCollector(settings, output_path=output_path)
+    resolved_feature_output = (
+        settings.storage.processed_data_path / "live"
+        if feature_output_path is None
+        else feature_output_path
+    )
+    collector = MarketDataCollector(
+        settings,
+        output_path=output_path,
+        feature_output_path=resolved_feature_output,
+    )
     try:
         summary = await collector.run(
             stop_event=stop_event,
@@ -186,6 +210,10 @@ async def run_collection(
             "parquet": summary.parquet,
             "pipeline": summary.pipeline,
             "feature_state": summary.feature_state,
+            "feature_output_path": summary.feature_output_path,
+            "feature_runtime": summary.feature_runtime,
+            "resources": summary.resources,
+            "collection_manifest": summary.collection_manifest,
         },
     )
     return 0
@@ -208,24 +236,66 @@ async def run_replay(
     symbols: list[str] | None,
     channels: list[str] | None,
     order: ReplayOrder,
+    source_mode: ReplaySourceMode = ReplaySourceMode.AUTO,
     speed: float | None,
+    feature_output_path: Path | None,
 ) -> int:
-    """Replay retained raw records without exchange connectivity."""
+    """Replay retained raw records and persist features without exchange connectivity."""
 
-    from cvf.features import FeatureStatePipeline, MarketStateStore
     from cvf.pipeline import NormalizedEventBus
 
+    if order is not ReplayOrder.RECEIVE_TIME:
+        raise ValueError(
+            "feature replay requires receive-time order to match the live timeline"
+        )
+    source = input_path.resolve()
+    destination = (
+        settings.storage.processed_data_path / "replay"
+        if feature_output_path is None
+        else feature_output_path
+    ).resolve()
+    if (
+        source == destination
+        or source in destination.parents
+        or destination in source.parents
+    ):
+        raise ValueError("replay input and feature output paths must be disjoint")
+    source_resolution = resolve_replay_source(source, source_mode)
+    resolved_source_mode = source_resolution.mode
+    if source_resolution.clean_collection is not None:
+        validate_replay_capture_lineage(
+            source_resolution,
+            ReplayRuntimeLineage(
+                code_version=__version__,
+                code_sha256=package_source_sha256(),
+                strategy_version=settings.app.strategy_version,
+                settings_sha256=settings_fingerprint(settings),
+            ),
+        )
     bus = NormalizedEventBus(
         default_queue_capacity=settings.pipeline.consumer_queue_capacity
     )
-    feature_state = FeatureStatePipeline(MarketStateStore(settings.features))
+    runtime = FeatureRuntime(settings, output_path=destination)
     bus.register(
-        "feature-state",
-        feature_state.consume,
+        "feature-runtime",
+        runtime.consume_event,
         queue_capacity=settings.pipeline.consumer_queue_capacity,
     )
-    reader = RawParquetReader(input_path)
-    filters = RawScanFilter(
+    reader = RawParquetReader(source)
+    if resolved_source_mode is ReplaySourceMode.JOURNAL:
+        if any((start, end, exchanges, symbols, channels)):
+            raise ValueError(
+                "exact journal replay requires the complete unfiltered collection run"
+            )
+        filters = RawScanFilter(
+            channels=frozenset({NORMALIZED_EVENT_JOURNAL_CHANNEL}),
+        )
+    else:
+        if channels and NORMALIZED_EVENT_JOURNAL_CHANNEL in channels:
+            raise ValueError(
+                "normalized-journal rows require --source-mode journal"
+            )
+        filters = RawScanFilter(
         start=start,
         end=end,
         exchanges=(
@@ -233,20 +303,56 @@ async def run_replay(
         ),
         symbols=None if not symbols else frozenset(symbols),
         channels=None if not channels else frozenset(channels),
+            excluded_channels=frozenset({NORMALIZED_EVENT_JOURNAL_CHANNEL}),
+        )
+    driver = ReceiveTimeFeatureDriver(
+        settings,
+        event_bus=bus,
+        runtime=runtime,
     )
     runner = ReplayRunner(
         event_bus=bus,
+        event_sink=driver.publish,
+        finish_sink=lambda watermark: driver.finish(
+            through_timestamp=watermark
+        ),
         order=order,
         speed=settings.replay.default_speed if speed is None else speed,
     )
-    summary = await runner.run(reader.iter_records(filters=filters, order=order))
+    await runtime.start()
+    try:
+        summary = await runner.run(
+            reader.iter_records(filters=filters, order=order)
+        )
+        if summary.raw_records == 0 or summary.normalized_events == 0:
+            raise RuntimeError(
+                "replay requires at least one selected raw row and normalized event"
+            )
+        if (
+            resolved_source_mode is ReplaySourceMode.JOURNAL
+            and summary.feature_timeline_end_records != 1
+        ):
+            raise RuntimeError(
+                "journal replay requires exactly one clean feature-timeline end marker"
+            )
+        if (
+            source_resolution.clean_collection is not None
+            and summary.normalized_events
+            != source_resolution.clean_collection.normalized_event_count
+        ):
+            raise RuntimeError(
+                "journal replay count diverged from its validated collection manifest"
+            )
+    finally:
+        await runtime.close()
     logging.getLogger("cvf").info(
         "raw replay complete",
         extra={
             "event": "replay_complete",
-            "input_path": str(input_path.resolve()),
+            "input_path": str(source),
+            "feature_output_path": str(destination),
             **asdict(summary),
-            "feature_state": asdict(feature_state.stats),
+            "feature_runtime": asdict(runtime.stats),
         },
     )
     return 0
@@ -287,6 +393,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="Override storage.raw_data_path for this collection",
     )
+    collect.add_argument(
+        "--feature-output",
+        type=Path,
+        help="Feature root; defaults to storage.processed_data_path/live",
+    )
     replay = subparsers.add_parser(
         "replay",
         help="Offline deterministic replay of retained raw Parquet",
@@ -303,15 +414,31 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--symbol", action="append")
     replay.add_argument("--channel", action="append")
     replay.add_argument(
+        "--source-mode",
+        type=ReplaySourceMode,
+        choices=list(ReplaySourceMode),
+        default=ReplaySourceMode.AUTO,
+        help=(
+            "Choose legacy raw recovery or an exact normalized journal; "
+            "auto uses only a manifest-validated CLEAN_END journal when present"
+        ),
+    )
+    replay.add_argument(
         "--order",
         type=ReplayOrder,
         choices=list(ReplayOrder),
-        default=ReplayOrder.EVENT_TIME,
+        default=ReplayOrder.RECEIVE_TIME,
+        help="Feature replay is fail-closed unless receive-time order is used",
     )
     replay.add_argument(
         "--speed",
         type=float,
         help="Replay multiplier; 0 is fastest and performs no wall-clock sleeps",
+    )
+    replay.add_argument(
+        "--feature-output",
+        type=Path,
+        help="Feature root; defaults to storage.processed_data_path/replay",
     )
     compact = subparsers.add_parser(
         "compact-raw",
@@ -387,6 +514,16 @@ def _parser() -> argparse.ArgumentParser:
         help="Receive-time matches live decision scheduling for a wall-clock collection",
     )
     phase3_acceptance.add_argument(
+        "--source-mode",
+        type=ReplaySourceMode,
+        choices=list(ReplaySourceMode),
+        default=ReplaySourceMode.AUTO,
+        help=(
+            "Choose legacy raw recovery or an exact normalized journal; "
+            "auto uses only a manifest-validated CLEAN_END journal when present"
+        ),
+    )
+    phase3_acceptance.add_argument(
         "--requested-stability-hours",
         type=float,
         default=6.0,
@@ -399,12 +536,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     phase3_stability = subparsers.add_parser(
         "stability-phase3",
-        help="Repeat fixed-data acceptance toward a six-hour wall-clock target",
+        help="Repeat fixed-data replay for a bounded observation (not a live soak)",
     )
     phase3_stability.add_argument("--config", type=Path)
     phase3_stability.add_argument("--input", type=Path, required=True)
     phase3_stability.add_argument("--output", type=Path, required=True)
-    phase3_stability.add_argument("--target-hours", type=float, default=6.0)
+    phase3_stability.add_argument(
+        "--target-hours",
+        type=float,
+        default=6.0,
+        help="Fixed-replay process observation target; does not prove a live soak",
+    )
     phase3_stability.add_argument("--maximum-iterations", type=int)
     phase3_stability.add_argument(
         "--retain-feature-trees",
@@ -432,6 +574,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     settings,
                     duration_seconds=args.duration,
                     output_path=args.output,
+                    feature_output_path=args.feature_output,
                 )
             )
         if args.command == "replay":
@@ -445,7 +588,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     symbols=args.symbol,
                     channels=args.channel,
                     order=args.order,
+                    source_mode=args.source_mode,
                     speed=args.speed,
+                    feature_output_path=args.feature_output,
                 )
             )
         if args.command == "compact-raw":
@@ -539,7 +684,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     second_batch_rows=args.second_batch_rows,
                     writer_flush_seconds=args.writer_flush_seconds,
                     replay_order=args.order,
-                    requested_stability_seconds=(
+                    replay_source_mode=args.source_mode,
+                    requested_live_stability_seconds=(
                         args.requested_stability_hours * 60 * 60
                     ),
                     resume=args.resume,
@@ -556,8 +702,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "throughput_above_realtime": (
                         acceptance_report.throughput_above_realtime
                     ),
-                    "full_stability_duration_completed": (
-                        acceptance_report.full_stability_duration_completed
+                    "live_stability_duration_completed": (
+                        acceptance_report.live_stability_duration_completed
                     ),
                 },
             )
@@ -581,9 +727,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "event": "phase3_stability_complete",
                     "input_path": str(stability_report.input_path),
                     "output_path": str(stability_report.output_path),
-                    "target_seconds": stability_report.target_seconds,
-                    "actual_wall_seconds": stability_report.actual_wall_seconds,
-                    "target_completed": stability_report.target_completed,
+                    "fixed_replay_target_seconds": (
+                        stability_report.fixed_replay_target_seconds
+                    ),
+                    "fixed_replay_actual_wall_seconds": (
+                        stability_report.fixed_replay_actual_wall_seconds
+                    ),
+                    "fixed_replay_target_reached": (
+                        stability_report.fixed_replay_target_reached
+                    ),
+                    "continuous_live_soak_completed": (
+                        stability_report.continuous_live_soak_completed
+                    ),
                     "iterations": len(stability_report.iterations),
                 },
             )

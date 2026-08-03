@@ -16,8 +16,18 @@ import pytest
 from cvf.acceptance import run_phase3_acceptance, run_phase3_stability
 from cvf.config import load_settings
 from cvf.models import Exchange
-from cvf.replay import ReplayOrder
-from cvf.storage import AsyncPartitionedParquetWriter, RawMarketRecord
+from cvf.replay import RawRecordNormalizer, ReplayOrder
+from cvf.storage import (
+    AsyncPartitionedParquetWriter,
+    RawMarketRecord,
+    audit_raw_tree,
+    begin_collection_manifest,
+    complete_collection_manifest,
+)
+from cvf.storage.raw import (
+    feature_timeline_end_journal_record,
+    normalized_event_journal_record,
+)
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
 
@@ -90,7 +100,7 @@ async def test_phase3_acceptance_replays_twice_and_writes_evidence() -> None:
             output_path=output,
             first_batch_rows=2,
             second_batch_rows=3,
-            requested_stability_seconds=3_600,
+            requested_live_stability_seconds=3_600,
         )
 
         assert report.raw_audit.rows == 2
@@ -101,13 +111,20 @@ async def test_phase3_acceptance_replays_twice_and_writes_evidence() -> None:
         assert report.feature_files_audited
         assert report.safety_boundary_preserved
         assert report.first_run.feature_ticks == 1
-        assert report.first_run.single_venue_snapshots == 3
+        assert report.first_run.single_venue_snapshots == 12
         assert report.first_run.cross_venue_snapshots == 6
-        assert report.first_run.feature_audit.rows == 9
+        assert report.first_run.feature_audit.rows == 18
         assert report.first_run.feature_state.accepted_events == 2
         assert report.first_run.writer_flush_seconds == 60
         assert report.first_run.replay_order is ReplayOrder.RECEIVE_TIME
-        assert not report.full_stability_duration_completed
+        assert report.first_run.safety_evidence.component_graph_matches_expected
+        assert report.first_run.safety_evidence.output_event_type_counts == {
+            "MARKET_FEATURE": 18
+        }
+        assert report.first_run.safety_evidence.forbidden_output_events_observed == 0
+        assert not report.first_run.safety_evidence.network_request_instrumentation_enabled
+        assert not report.live_stability_duration_completed
+        assert report.live_stability_status.startswith("pending:")
         assert (output / "summary.json").is_file()
         assert (output / "summary.md").is_file()
         assert (output / "run-1-metrics.json").is_file()
@@ -126,7 +143,7 @@ async def test_phase3_acceptance_replays_twice_and_writes_evidence() -> None:
             output_path=output,
             first_batch_rows=2,
             second_batch_rows=3,
-            requested_stability_seconds=3_600,
+            requested_live_stability_seconds=3_600,
             resume=True,
         )
 
@@ -161,16 +178,66 @@ async def test_phase3_stability_records_an_honest_capped_observation() -> None:
         )
 
         assert len(report.iterations) == 1
-        assert not report.target_completed
-        assert report.status.startswith("pending:")
+        assert not report.fixed_replay_target_reached
+        assert not report.continuous_live_soak_completed
+        assert "continuous live-feed soak remains pending" in report.status
         assert report.all_deterministic
         assert report.all_no_lookahead
         assert report.all_feature_files_audited
         assert report.all_safety_boundaries_preserved
         assert report.total_raw_records == 4
         assert report.total_normalized_events == 4
-        assert report.total_feature_snapshots == 18
+        assert report.total_feature_snapshots == 36
         assert not (output / "iterations" / "0001" / "run-1").exists()
         assert not (output / "iterations" / "0001" / "run-2").exists()
         assert (output / "stability-summary.json").is_file()
         assert (output / "stability-summary.md").is_file()
+
+
+@pytest.mark.asyncio
+async def test_journal_acceptance_rejects_capture_lineage_mismatch_before_output() -> None:
+    with scratch_directory() as temporary:
+        raw = temporary / "raw"
+        output = temporary / "must-not-exist"
+        settings = load_settings(environ={})
+        started = begin_collection_manifest(
+            raw,
+            started_at=NOW - timedelta(seconds=1),
+            code_version="0.3.1",
+            strategy_version=settings.app.strategy_version,
+            settings_sha256="0" * 64,
+        )
+        source = agg_trade(1, 0)
+        event = RawRecordNormalizer().normalize(source)[0]
+        terminal = event.local_receive_timestamp + timedelta(seconds=1)
+        writer = AsyncPartitionedParquetWriter(
+            root_path=raw,
+            batch_rows=3,
+            flush_seconds=60,
+            queue_capacity=10,
+        )
+        await writer.start()
+        for record in (
+            source,
+            normalized_event_journal_record(event),
+            feature_timeline_end_journal_record(terminal),
+        ):
+            await writer.write(record)
+        await writer.close()
+        complete_collection_manifest(
+            raw,
+            expected_run_id=started.run_id,
+            terminal_at=terminal + timedelta(seconds=1),
+            feature_timeline_end_at=terminal,
+            normalized_event_count=1,
+            raw_audit=audit_raw_tree(raw),
+        )
+
+        with pytest.raises(RuntimeError, match="settings_sha256"):
+            await run_phase3_acceptance(
+                settings,
+                input_path=raw,
+                output_path=output,
+            )
+
+        assert not output.exists()

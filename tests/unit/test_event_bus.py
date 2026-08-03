@@ -86,6 +86,41 @@ async def test_applies_backpressure_without_dropping() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_backpressure_publish_does_not_enqueue_later() -> None:
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    received: list[int] = []
+    bus = NormalizedEventBus(default_queue_capacity=1)
+
+    async def slow_consumer(event: Trade) -> None:
+        entered.set()
+        await release.wait()
+        received.append(int(event.trade_id))
+
+    bus.register("slow", slow_consumer)  # type: ignore[arg-type]
+    await bus.start()
+    await bus.publish(trade(1))
+    await entered.wait()
+    await bus.publish(trade(2))
+    blocked_publish = asyncio.create_task(bus.publish(trade(3)))
+    await asyncio.sleep(0)
+
+    assert not blocked_publish.done()
+
+    blocked_publish.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked_publish
+    assert bus.stats["slow"].published_events == 2
+
+    release.set()
+    await bus.close()
+
+    assert received == [1, 2]
+    assert bus.stats["slow"].queue_depth == 0
+    assert bus.stats["slow"].processed_events == 2
+
+
+@pytest.mark.asyncio
 async def test_consumer_failure_is_observable() -> None:
     bus = NormalizedEventBus(default_queue_capacity=1)
 
@@ -142,3 +177,50 @@ async def test_drain_surfaces_consumer_failure_without_hanging() -> None:
         await bus.drain()
     with pytest.raises(EventBusError, match="drain failure"):
         await bus.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_close_cancellation_still_drains_and_stops_consumers() -> None:
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    received: list[int] = []
+    bus = NormalizedEventBus(default_queue_capacity=1)
+
+    async def slow_consumer(event: Trade) -> None:
+        entered.set()
+        await release.wait()
+        received.append(int(event.trade_id))
+
+    bus.register("slow", slow_consumer)  # type: ignore[arg-type]
+    await bus.start()
+    await bus.publish(trade(1))
+    await entered.wait()
+    await bus.publish(trade(2))
+
+    closing = asyncio.create_task(bus.close())
+    while bus._close_task is None:
+        await asyncio.sleep(0)
+    saved_close_task = bus._close_task
+    closing.cancel()
+    await asyncio.sleep(0)
+    closing.cancel()
+    await asyncio.sleep(0)
+
+    assert not closing.done()
+    assert not saved_close_task.cancelled()
+    assert not bus._closed
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    await bus.close()
+
+    assert received == [1, 2]
+    assert bus._closed
+    assert saved_close_task.done()
+    assert bus.stats["slow"].queue_depth == 0
+    assert bus.stats["slow"].processed_events == 2
+    assert all(
+        runtime.task is not None and runtime.task.done()
+        for runtime in bus._consumers.values()
+    )
