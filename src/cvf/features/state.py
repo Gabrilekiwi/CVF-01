@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 
 from cvf.config import FeaturesConfig
-from cvf.features.rolling import AppendStatus, BoundedTimeWindow, LateEventPolicy
+from cvf.features.lineage import SourceLineage
+from cvf.features.rolling import (
+    AppendStatus,
+    BoundedTimeWindow,
+    LateEventPolicy,
+    TimedValue,
+)
 from cvf.models.enums import EventType, Exchange, HealthStatus
 from cvf.models.market import (
     BestBidAsk,
@@ -43,6 +49,7 @@ class StateUpdateStatus(StrEnum):
     LATE_DROPPED = "LATE_DROPPED"
     EXPIRED_DROPPED = "EXPIRED_DROPPED"
     STALE_GENERATION = "STALE_GENERATION"
+    STALE_SEQUENCE = "STALE_SEQUENCE"
     BUFFERED_FOR_SNAPSHOT = "BUFFERED_FOR_SNAPSHOT"
     BOOK_INVALIDATED = "BOOK_INVALIDATED"
 
@@ -59,12 +66,15 @@ class StateUpdateResult:
 @dataclass(frozen=True, slots=True)
 class FeatureBookView:
     generation: int
+    epoch: int
     sequence_id: int | None
     synchronized: bool
+    synchronized_since: datetime | None
     bids: tuple[OrderBookLevel, ...]
     asks: tuple[OrderBookLevel, ...]
     pending_updates: int
     last_error: str | None
+    lineage: SourceLineage
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +86,15 @@ class BookChange:
     removed_bid_quantity: Decimal
     removed_ask_quantity: Decimal
     order_flow_imbalance: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureBookCheckpoint:
+    """Immutable event-time book state plus any state-changing source."""
+
+    view: FeatureBookView
+    source_event: OrderBookSnapshot | OrderBookUpdate | None
+    change: BookChange | None
 
 
 def _sequence(value: int | str | None) -> int | None:
@@ -98,20 +117,41 @@ class FeatureOrderBookState:
         self._bids: dict[Decimal, Decimal] = {}
         self._asks: dict[Decimal, Decimal] = {}
         self.generation = 0
+        self.epoch = 0
         self.sequence_id: int | None = None
         self.synchronized = False
+        self.synchronized_since: datetime | None = None
         self.last_error: str | None = None
         self.last_change: BookChange | None = None
+        self._lineage = SourceLineage()
 
-    def _reset(self, generation: int, reason: str | None = None) -> None:
+    def _reset(
+        self,
+        generation: int,
+        reason: str | None = None,
+        *,
+        advance_epoch: bool = True,
+    ) -> None:
         self._bids.clear()
         self._asks.clear()
         self._pending.clear()
         self.generation = generation
+        if advance_epoch:
+            self.epoch += 1
         self.sequence_id = None
         self.synchronized = False
+        self.synchronized_since = None
         self.last_error = reason
         self.last_change = None
+        self._lineage = SourceLineage()
+
+    def _record_lineage(
+        self,
+        event: OrderBookSnapshot | OrderBookUpdate,
+    ) -> None:
+        self._lineage = self._lineage.combine(
+            SourceLineage.from_source(event.exchange_timestamp, event)
+        )
 
     @staticmethod
     def _apply_side(
@@ -133,10 +173,12 @@ class FeatureOrderBookState:
         self._apply_side(self._asks, asks)
         if not self._bids or not self._asks:
             self.synchronized = False
+            self.synchronized_since = None
             self.last_error = "order book side became empty"
             return False
         if max(self._bids) >= min(self._asks):
             self.synchronized = False
+            self.synchronized_since = None
             self.last_error = "order book became crossed or locked"
             return False
         return True
@@ -176,26 +218,61 @@ class FeatureOrderBookState:
 
     def _buffer(self, update: OrderBookUpdate) -> StateUpdateStatus:
         if len(self._pending) >= self._pending_capacity:
+            previous_lineage = self._lineage
             self._reset(update.generation, "pending order-book update capacity exceeded")
+            self._lineage = previous_lineage
+            self._record_lineage(update)
             return StateUpdateStatus.BOOK_INVALIDATED
         self._pending.append(update)
+        self._record_lineage(update)
         return StateUpdateStatus.BUFFERED_FOR_SNAPSHOT
 
     def apply_snapshot(self, snapshot: OrderBookSnapshot) -> StateUpdateStatus:
         if snapshot.generation < self.generation:
             return StateUpdateStatus.STALE_GENERATION
+        snapshot_sequence = _sequence(snapshot.sequence_id)
+        if (
+            snapshot.generation == self.generation
+            and self.synchronized
+            and snapshot_sequence is not None
+            and self.sequence_id is not None
+            and snapshot_sequence <= self.sequence_id
+        ):
+            return StateUpdateStatus.STALE_SEQUENCE
         pending = (
             list(self._pending)
             if snapshot.generation == self.generation
             else []
         )
-        self._reset(snapshot.generation)
+        same_generation = snapshot.generation == self.generation
+        previous_lineage = self._lineage
+        continuing_synchronization = (
+            same_generation and self.synchronized
+        )
+        synchronized_since = self.synchronized_since
+        self._reset(
+            snapshot.generation,
+            advance_epoch=not continuing_synchronization,
+        )
+        if same_generation:
+            self._lineage = previous_lineage
+        self._record_lineage(snapshot)
         self._bids = {level.price: level.quantity for level in snapshot.bids}
         self._asks = {level.price: level.quantity for level in snapshot.asks}
         self.sequence_id = _sequence(snapshot.sequence_id)
         self.synchronized = bool(self._bids and self._asks)
+        self.synchronized_since = (
+            (
+                synchronized_since
+                if continuing_synchronization
+                else snapshot.exchange_timestamp
+            )
+            if self.synchronized
+            else None
+        )
         if self.synchronized and max(self._bids) >= min(self._asks):
             self.synchronized = False
+            self.synchronized_since = None
             self.last_error = "snapshot is crossed or locked"
             return StateUpdateStatus.BOOK_INVALIDATED
         for update in sorted(
@@ -209,6 +286,7 @@ class FeatureOrderBookState:
                     continue
                 if previous is not None and previous > self.sequence_id:
                     self.synchronized = False
+                    self.synchronized_since = None
                     self.last_error = "pending update has a sequence gap"
                     return StateUpdateStatus.BOOK_INVALIDATED
             change = self._measure_change(update)
@@ -234,13 +312,15 @@ class FeatureOrderBookState:
         previous = _sequence(update.previous_sequence_id)
         if sequence is not None and self.sequence_id is not None:
             if sequence <= self.sequence_id:
-                return StateUpdateStatus.STALE_GENERATION
+                return StateUpdateStatus.STALE_SEQUENCE
             if previous is not None and previous != self.sequence_id:
                 self.synchronized = False
+                self.synchronized_since = None
                 self.last_error = "order-book update sequence gap"
                 self._pending.clear()
                 return self._buffer(update)
         change = self._measure_change(update)
+        self._record_lineage(update)
         if not self._apply_levels(update.bids, update.asks):
             return StateUpdateStatus.BOOK_INVALIDATED
         self.last_change = change
@@ -260,12 +340,15 @@ class FeatureOrderBookState:
         )
         return FeatureBookView(
             generation=self.generation,
+            epoch=self.epoch,
             sequence_id=self.sequence_id,
             synchronized=self.synchronized,
+            synchronized_since=self.synchronized_since,
             bids=bids,
             asks=asks,
             pending_updates=len(self._pending),
             last_error=self.last_error,
+            lineage=self._lineage,
         )
 
 
@@ -282,6 +365,9 @@ class VenueSymbolState:
     liquidations: BoundedTimeWindow[LiquidationEvent]
     book_updates: BoundedTimeWindow[OrderBookSnapshot | OrderBookUpdate]
     book_changes: BoundedTimeWindow[BookChange]
+    book_history: BoundedTimeWindow[FeatureBookCheckpoint]
+    exchange_health_events: BoundedTimeWindow[ExchangeHealth]
+    health_events: BoundedTimeWindow[ExchangeHealth]
     order_book: FeatureOrderBookState
     latest_by_type: dict[EventType, StatefulMarketEvent] = field(default_factory=dict)
     health_by_channel: dict[str, HealthStatus] = field(default_factory=dict)
@@ -301,8 +387,33 @@ class VenueSymbolState:
                 self.liquidations,
                 self.book_updates,
                 self.book_changes,
+                self.book_history,
+                self.health_events,
             )
         )
+
+    def health_sources_at_or_before(
+        self,
+        boundary: datetime,
+    ) -> tuple[TimedValue[ExchangeHealth], ...]:
+        """Return the latest deterministic health event for each channel."""
+
+        if boundary.tzinfo is None or boundary.utcoffset() is None:
+            raise ValueError("health decision boundary must be timezone-aware")
+        decision = boundary.astimezone(UTC)
+        candidates = [
+            (item.timestamp, scope, item.ordinal, item)
+            for scope, window in (
+                (0, self.exchange_health_events),
+                (1, self.health_events),
+            )
+            for item in window
+            if item.timestamp <= decision
+        ]
+        latest: dict[str, TimedValue[ExchangeHealth]] = {}
+        for _timestamp, _scope, _ordinal, item in sorted(candidates):
+            latest[item.value.channel] = item
+        return tuple(latest[channel] for channel in sorted(latest))
 
 
 class MarketStateStore:
@@ -314,8 +425,40 @@ class MarketStateStore:
         self._retention = timedelta(seconds=config.state_retention_seconds)
         self._maximum_lateness = timedelta(milliseconds=config.maximum_lateness_ms)
         self._late_policy = LateEventPolicy(config.late_event_policy)
+        self._exchange_health_events = {
+            exchange: self._health_window()
+            for exchange in (Exchange.BINANCE, Exchange.OKX)
+        }
 
     def _window(self) -> BoundedTimeWindow[object]:
+        return BoundedTimeWindow(
+            retention=self._retention,
+            maximum_items=self._config.maximum_events_per_stream,
+            late_event_policy=self._late_policy,
+            maximum_lateness=self._maximum_lateness,
+        )
+
+    def _book_event_window(
+        self,
+    ) -> BoundedTimeWindow[OrderBookSnapshot | OrderBookUpdate]:
+        """Keep the non-commutative book timeline strictly forward-only."""
+
+        return BoundedTimeWindow(
+            retention=self._retention,
+            maximum_items=self._config.maximum_events_per_stream,
+            late_event_policy=LateEventPolicy.DROP,
+            maximum_lateness=timedelta(0),
+        )
+
+    def _book_history_window(self) -> BoundedTimeWindow[FeatureBookCheckpoint]:
+        return BoundedTimeWindow(
+            retention=self._retention,
+            maximum_items=self._config.maximum_events_per_stream,
+            late_event_policy=LateEventPolicy.INSERT,
+            maximum_lateness=self._retention,
+        )
+
+    def _health_window(self) -> BoundedTimeWindow[ExchangeHealth]:
         return BoundedTimeWindow(
             retention=self._retention,
             maximum_items=self._config.maximum_events_per_stream,
@@ -334,8 +477,11 @@ class MarketStateStore:
             mark_prices=self._window(),  # type: ignore[arg-type]
             index_prices=self._window(),  # type: ignore[arg-type]
             liquidations=self._window(),  # type: ignore[arg-type]
-            book_updates=self._window(),  # type: ignore[arg-type]
+            book_updates=self._book_event_window(),
             book_changes=self._window(),  # type: ignore[arg-type]
+            book_history=self._book_history_window(),
+            exchange_health_events=self._exchange_health_events[exchange],
+            health_events=self._health_window(),
             order_book=FeatureOrderBookState(
                 pending_capacity=self._config.book_pending_updates
             ),
@@ -355,6 +501,13 @@ class MarketStateStore:
     def states(self) -> tuple[VenueSymbolState, ...]:
         return tuple(self._states.values())
 
+    @property
+    def retained_items(self) -> int:
+        return (
+            sum(state.total_items() for state in self._states.values())
+            + sum(len(window) for window in self._exchange_health_events.values())
+        )
+
     @staticmethod
     def _window_status(status: AppendStatus) -> StateUpdateStatus:
         if status is AppendStatus.LATE_DROPPED:
@@ -364,13 +517,35 @@ class MarketStateStore:
         return StateUpdateStatus.ACCEPTED
 
     def ingest(self, event: NormalizedMarketEvent) -> StateUpdateResult:
+        if isinstance(event, ExchangeHealth):
+            status = self.update_health(event)
+            return StateUpdateResult(
+                status=status,
+                exchange=event.exchange,
+                symbol=event.symbol,
+                event_type=event.event_type,
+                reason=None,
+            )
         state = self.state(event.exchange, event.symbol)
         status = StateUpdateStatus.ACCEPTED
         event_at = event.exchange_timestamp
+        book_change: BookChange | None = None
         if isinstance(event, OrderBookSnapshot):
+            admissibility = self._window_status(
+                state.book_updates.admissibility(event_at)
+            )
+            if admissibility is not StateUpdateStatus.ACCEPTED:
+                state.rejected_events += 1
+                return StateUpdateResult(
+                    status=admissibility,
+                    exchange=event.exchange,
+                    symbol=event.symbol,
+                    event_type=event.event_type,
+                    reason="order-book event is outside the admissible event-time bound",
+                )
             previous_generation = state.order_book.generation
             status = state.order_book.apply_snapshot(event)
-            if event.generation != previous_generation:
+            if state.order_book.generation != previous_generation:
                 state.book_updates.clear()
                 state.book_changes.clear()
             if status is StateUpdateStatus.ACCEPTED:
@@ -378,15 +553,28 @@ class MarketStateStore:
                 window_status = state.book_updates.append(event_at, event)
                 status = self._window_status(window_status)
         elif isinstance(event, OrderBookUpdate):
+            admissibility = self._window_status(
+                state.book_updates.admissibility(event_at)
+            )
+            if admissibility is not StateUpdateStatus.ACCEPTED:
+                state.rejected_events += 1
+                return StateUpdateResult(
+                    status=admissibility,
+                    exchange=event.exchange,
+                    symbol=event.symbol,
+                    event_type=event.event_type,
+                    reason="order-book event is outside the admissible event-time bound",
+                )
             previous_generation = state.order_book.generation
             status = state.order_book.apply_update(event)
-            if event.generation != previous_generation:
+            if state.order_book.generation != previous_generation:
                 state.book_updates.clear()
                 state.book_changes.clear()
             if status is StateUpdateStatus.ACCEPTED:
                 status = self._window_status(state.book_updates.append(event_at, event))
                 change = state.order_book.last_change
                 if change is not None and status is StateUpdateStatus.ACCEPTED:
+                    book_change = change
                     status = self._window_status(state.book_changes.append(event_at, change))
         elif isinstance(event, Trade):
             status = self._window_status(state.trades.append(event_at, event))
@@ -408,6 +596,54 @@ class MarketStateStore:
             status = self._window_status(state.index_prices.append(event_at, event))
         elif isinstance(event, LiquidationEvent):
             status = self._window_status(state.liquidations.append(event_at, event))
+
+        if status in {
+            StateUpdateStatus.STALE_GENERATION,
+            StateUpdateStatus.STALE_SEQUENCE,
+        }:
+            state.rejected_events += 1
+            return StateUpdateResult(
+                status=status,
+                exchange=event.exchange,
+                symbol=event.symbol,
+                event_type=event.event_type,
+                reason=(
+                    "order-book generation is stale"
+                    if status is StateUpdateStatus.STALE_GENERATION
+                    else "order-book sequence does not advance current state"
+                ),
+            )
+
+        if isinstance(event, (OrderBookSnapshot, OrderBookUpdate)):
+            history_status = self._window_status(
+                state.book_history.append(
+                    event_at,
+                    FeatureBookCheckpoint(
+                        view=state.order_book.view(
+                            depth=self._config.order_book_depth
+                        ),
+                        source_event=(
+                            event
+                            if status
+                            not in {
+                                StateUpdateStatus.LATE_DROPPED,
+                                StateUpdateStatus.EXPIRED_DROPPED,
+                            }
+                            else None
+                        ),
+                        change=(
+                            book_change
+                            if status is StateUpdateStatus.ACCEPTED
+                            else None
+                        ),
+                    ),
+                )
+            )
+            if (
+                status is StateUpdateStatus.ACCEPTED
+                and history_status is not StateUpdateStatus.ACCEPTED
+            ):
+                status = history_status
 
         if status is StateUpdateStatus.ACCEPTED:
             state.accepted_events += 1
@@ -438,13 +674,28 @@ class MarketStateStore:
             ),
         )
 
-    def update_health(self, health: ExchangeHealth) -> None:
+    def update_health(self, health: ExchangeHealth) -> StateUpdateStatus:
+        if health.exchange not in self._exchange_health_events:
+            raise ValueError("feature health requires a concrete market-data exchange")
+        event_at = health.exchange_timestamp
         if health.symbol == "*":
+            status = self._window_status(
+                self._exchange_health_events[health.exchange].append(
+                    event_at,
+                    health,
+                )
+            )
+            if status is not StateUpdateStatus.ACCEPTED:
+                return status
             for state in self._states.values():
                 if state.exchange is health.exchange:
                     state.health_by_channel[health.channel] = health.status
-            return
-        self.state(health.exchange, health.symbol).health_by_channel[health.channel] = health.status
+            return status
+        state = self.state(health.exchange, health.symbol)
+        status = self._window_status(state.health_events.append(event_at, health))
+        if status is StateUpdateStatus.ACCEPTED:
+            state.health_by_channel[health.channel] = health.status
+        return status
 
     def update_stream_health(self, health: StreamHealthSnapshot) -> None:
         if health.key.symbol == "*":

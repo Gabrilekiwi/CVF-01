@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import math
 import os
 import sys
 from collections.abc import Mapping
@@ -38,7 +37,6 @@ class AppConfig(FrozenConfigModel):
 
 class MarketsConfig(FrozenConfigModel):
     canonical_symbols: list[str] = Field(min_length=1)
-    max_open_positions: int = Field(ge=1, le=1)
 
     @field_validator("canonical_symbols")
     @classmethod
@@ -54,18 +52,6 @@ class TimingConfig(FrozenConfigModel):
     signal_check_seconds: float = Field(gt=0)
     feature_windows_seconds: list[int] = Field(min_length=1)
     statistics_windows_seconds: list[int] = Field(min_length=1)
-    expected_holding_minutes: tuple[int, int]
-    time_stop_check_minutes: int = Field(gt=0)
-    maximum_holding_minutes: int = Field(gt=0)
-
-    @model_validator(mode="after")
-    def validate_holding_range(self) -> TimingConfig:
-        lower, upper = self.expected_holding_minutes
-        if lower <= 0 or upper < lower:
-            raise ValueError("expected_holding_minutes must be an increasing positive range")
-        if self.maximum_holding_minutes < upper:
-            raise ValueError("maximum_holding_minutes must cover expected_holding_minutes")
-        return self
 
 
 class ExchangeConnectionConfig(FrozenConfigModel):
@@ -123,6 +109,7 @@ class FeaturesConfig(FrozenConfigModel):
     maximum_events_per_stream: int = Field(default=500_000, gt=0)
     late_event_policy: Literal["drop", "insert"] = "drop"
     maximum_lateness_ms: int = Field(default=250, ge=0)
+    receive_time_reorder_ms: int = Field(default=250, gt=0)
     book_pending_updates: int = Field(default=10_000, gt=0)
     large_trade_notional_usdt: Decimal = Field(default=Decimal("100000"), gt=0)
     depth_walk_notional_usdt: Decimal = Field(default=Decimal("10000"), gt=0)
@@ -151,115 +138,6 @@ class FeaturesConfig(FrozenConfigModel):
         )
         if self.state_retention_seconds < required_retention:
             raise ValueError("state_retention_seconds must cover every configured feature window")
-        return self
-
-
-class ExchangeFactorWeights(FrozenConfigModel):
-    taker_imbalance: float = Field(ge=0)
-    ofi: float = Field(ge=0)
-    price_impulse: float = Field(ge=0)
-    open_interest_impulse: float = Field(ge=0)
-    liquidation_impulse: float = Field(ge=0)
-
-    @model_validator(mode="after")
-    def weights_sum_to_one(self) -> ExchangeFactorWeights:
-        if not math.isclose(sum(self.model_dump().values()), 1.0, abs_tol=1e-9):
-            raise ValueError("exchange factor weights must sum to 1.0")
-        return self
-
-
-class VenueWeights(FrozenConfigModel):
-    binance: float = Field(ge=0)
-    okx: float = Field(ge=0)
-    cross_exchange_confirmation: float = Field(ge=0)
-
-    @model_validator(mode="after")
-    def weights_sum_to_one(self) -> VenueWeights:
-        if not math.isclose(sum(self.model_dump().values()), 1.0, abs_tol=1e-9):
-            raise ValueError("venue weights must sum to 1.0")
-        return self
-
-
-class ScoringConfig(FrozenConfigModel):
-    exchange_factor_weights: ExchangeFactorWeights
-    venue_weights: VenueWeights
-    long_entry_threshold: float
-    short_entry_threshold: float
-    liquidity_penalty_max: float = Field(ge=0)
-    crowding_penalty_max: float = Field(ge=0)
-    data_health_penalty_max: float = Field(ge=0)
-    divergence_penalty_max: float = Field(ge=0)
-
-    @model_validator(mode="after")
-    def thresholds_are_ordered(self) -> ScoringConfig:
-        if self.short_entry_threshold >= self.long_entry_threshold:
-            raise ValueError("short_entry_threshold must be below long_entry_threshold")
-        return self
-
-
-class SignalRulesConfig(FrozenConfigModel):
-    taker_imbalance_15s_min: float = Field(ge=0, le=1)
-    taker_imbalance_5s_confirmation: float = Field(ge=0, le=1)
-    ofi_zscore_confirmation: float = Field(gt=0)
-    open_interest_zscore_confirmation: float = Field(gt=0)
-    other_venue_open_interest_zscore_floor: float
-    maximum_recent_move_atr: float = Field(gt=0)
-    maximum_cross_venue_spread_zscore: float = Field(gt=0)
-    maximum_crowding_zscore: float = Field(gt=0)
-    signal_ttl_seconds: int = Field(gt=0)
-
-
-class FeeConfig(FrozenConfigModel):
-    maker_bps: float = Field(ge=0)
-    taker_bps: float = Field(ge=0)
-
-
-class FeesConfig(FrozenConfigModel):
-    binance: FeeConfig
-    okx: FeeConfig
-
-
-class SlippageConfig(FrozenConfigModel):
-    order_book_levels: int = Field(ge=1)
-    maximum_profit_share: float = Field(gt=0, le=1)
-    fallback_bps: float = Field(ge=0)
-
-
-class ExecutionConfig(FrozenConfigModel):
-    fees: FeesConfig
-    slippage: SlippageConfig
-    latency_penalty_bps_per_100ms: float = Field(ge=0)
-    depth_penalty_bps: float = Field(ge=0)
-
-
-class RiskConfig(FrozenConfigModel):
-    initial_balance_usdt: float = Field(gt=0)
-    risk_per_trade_fraction: float = Field(gt=0, lt=1)
-    daily_loss_limit_fraction: float = Field(gt=0, lt=1)
-    maximum_daily_trades: int = Field(gt=0)
-    consecutive_loss_limit: int = Field(gt=0)
-    maximum_open_positions: int = Field(ge=1, le=1)
-    maximum_notional_leverage: float = Field(gt=0)
-    margin_mode: Literal["isolated"]
-    allow_loss_adding: Literal[False] = False
-    allow_martingale: Literal[False] = False
-
-
-class ExitsConfig(FrozenConfigModel):
-    initial_stop_atr_multiple: float = Field(gt=0)
-    take_profit_1_atr_multiple: float = Field(gt=0)
-    take_profit_2_atr_multiple: float = Field(gt=0)
-    take_profit_1_fraction: float = Field(gt=0, lt=1)
-    breakeven_offset_bps: float = Field(ge=0)
-    time_stop_minutes: int = Field(gt=0)
-    time_stop_minimum_profit_atr: float = Field(ge=0)
-    maximum_holding_minutes: int = Field(gt=0)
-    reverse_score_exit_threshold: float = Field(gt=0)
-
-    @model_validator(mode="after")
-    def take_profits_are_ordered(self) -> ExitsConfig:
-        if self.take_profit_2_atr_multiple <= self.take_profit_1_atr_multiple:
-            raise ValueError("take_profit_2_atr_multiple must exceed take_profit_1_atr_multiple")
         return self
 
 
@@ -333,11 +211,6 @@ class Settings(FrozenConfigModel):
     timing: TimingConfig
     exchanges: ExchangesConfig
     features: FeaturesConfig
-    scoring: ScoringConfig
-    signal_rules: SignalRulesConfig
-    execution: ExecutionConfig
-    risk: RiskConfig
-    exits: ExitsConfig
     health: HealthConfig
     storage: StorageConfig
     pipeline: PipelineConfig
@@ -353,10 +226,6 @@ class Settings(FrozenConfigModel):
         ):
             if set(exchange_config.symbols) != expected:
                 raise ValueError(f"{venue} symbol map must exactly match markets.canonical_symbols")
-        if self.risk.maximum_open_positions != self.markets.max_open_positions:
-            raise ValueError("market and risk maximum_open_positions must agree")
-        if self.execution.slippage.order_book_levels > self.features.order_book_depth:
-            raise ValueError("slippage depth cannot exceed the stored order-book depth")
         return self
 
 

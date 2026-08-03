@@ -21,9 +21,10 @@ class Phase3StabilityReport:
     generated_at: datetime
     input_path: Path
     output_path: Path
-    target_seconds: float
-    actual_wall_seconds: float
-    target_completed: bool
+    fixed_replay_target_seconds: float
+    fixed_replay_actual_wall_seconds: float
+    fixed_replay_target_reached: bool
+    continuous_live_soak_completed: bool
     status: str
     retain_feature_trees: bool
     iterations: tuple[Phase3AcceptanceReport, ...]
@@ -85,9 +86,22 @@ def _render_markdown(report: Phase3StabilityReport) -> str:
         "",
         f"- Generated: `{report.generated_at.astimezone(UTC).isoformat()}`",
         f"- Fixed input: `{report.input_path}`",
-        f"- Target: `{report.target_seconds:.3f}` seconds",
-        f"- Actual wall time: `{report.actual_wall_seconds:.3f}` seconds",
-        f"- Target completed: `{report.target_completed}`",
+        (
+            "- Fixed-replay stress target: "
+            f"`{report.fixed_replay_target_seconds:.3f}` seconds"
+        ),
+        (
+            "- Fixed-replay actual wall time: "
+            f"`{report.fixed_replay_actual_wall_seconds:.3f}` seconds"
+        ),
+        (
+            "- Fixed-replay target reached: "
+            f"`{report.fixed_replay_target_reached}`"
+        ),
+        (
+            "- Continuous live-feed soak completed: "
+            f"`{report.continuous_live_soak_completed}`"
+        ),
         f"- Status: {report.status}",
         f"- Iterations: `{len(report.iterations)}`",
         f"- All deterministic: `{report.all_deterministic}`",
@@ -136,7 +150,7 @@ async def run_phase3_stability(
     maximum_iterations: int | None = None,
     retain_feature_trees: bool = False,
 ) -> Phase3StabilityReport:
-    """Repeat strict Phase 3 acceptance until a wall target or explicit iteration cap."""
+    """Repeat fixed-data acceptance as stress evidence, never as a live-soak substitute."""
 
     if target_seconds <= 0:
         raise ValueError("stability target must be positive")
@@ -162,7 +176,7 @@ async def run_phase3_stability(
             settings,
             input_path=source,
             output_path=destination / "iterations" / f"{iteration_number:04d}",
-            requested_stability_seconds=target_seconds,
+            requested_live_stability_seconds=target_seconds,
         )
         iterations.append(acceptance_report)
         if not retain_feature_trees:
@@ -174,19 +188,26 @@ async def run_phase3_stability(
         for iteration in iterations
         for run in (iteration.first_run, iteration.second_run)
     ]
-    target_completed = actual_wall_seconds >= target_seconds
+    fixed_replay_target_reached = actual_wall_seconds >= target_seconds
     stability_report = Phase3StabilityReport(
-        schema_version=1,
+        schema_version=2,
         generated_at=datetime.now(tz=UTC),
         input_path=source,
         output_path=destination,
-        target_seconds=target_seconds,
-        actual_wall_seconds=actual_wall_seconds,
-        target_completed=target_completed,
+        fixed_replay_target_seconds=target_seconds,
+        fixed_replay_actual_wall_seconds=actual_wall_seconds,
+        fixed_replay_target_reached=fixed_replay_target_reached,
+        continuous_live_soak_completed=False,
         status=(
-            "completed"
-            if target_completed
-            else "pending: stopped at the configured iteration cap before the target"
+            (
+                "fixed-replay stress target reached; continuous live-feed soak "
+                "with reconnect/resynchronization remains pending"
+            )
+            if fixed_replay_target_reached
+            else (
+                "fixed-replay stress stopped at the configured iteration cap; "
+                "continuous live-feed soak remains pending"
+            )
         ),
         retain_feature_trees=retain_feature_trees,
         iterations=tuple(iterations),

@@ -32,7 +32,12 @@ from cvf.features.models import (
     StrengthAgreement,
 )
 from cvf.models.enums import Exchange
-from cvf.utils.fingerprint import settings_fingerprint
+from cvf.utils.fingerprint import (
+    canonical_json,
+    canonicalize_for_hash,
+    settings_fingerprint,
+    sha256_text,
+)
 
 
 def _utc(value: datetime) -> datetime:
@@ -188,14 +193,6 @@ class CrossVenueFeatureEngine:
             decision=decision,
             selection_reasons=(binance_reason, okx_reason),
         )
-        feature_id = self._feature_id(
-            symbol=symbol,
-            decision=decision,
-            window_seconds=window_seconds,
-            binance=binance,
-            okx=okx,
-            status=alignment.status,
-        )
         lead_lag = LeadLagResearchFeatureValues(
             alignment_quality=alignment.quality,
             unavailable_reasons=(
@@ -230,8 +227,51 @@ class CrossVenueFeatureEngine:
             )
             if age is not None
         )
+        source_event_count = sum(
+            snapshot.source_event_count for snapshot in sources
+        )
+        oldest_source_timestamp = (
+            min(source_timestamps) if source_timestamps else None
+        )
+        newest_source_timestamp = (
+            max(source_timestamps) if source_timestamps else None
+        )
+        data_age_ms = max(data_ages) if data_ages else None
+        identity_base = {
+            "strategy_version": self.settings.app.strategy_version,
+            "code_version": __version__,
+            "config_hash": self.config_hash,
+            "symbol": symbol,
+            "decision_timestamp": decision,
+            "window_seconds": window_seconds,
+            "binance_book_generation": (
+                None if binance is None else binance.book_generation
+            ),
+            "okx_book_generation": (
+                None if okx is None else okx.book_generation
+            ),
+            "source_snapshot_ids": source_ids,
+            "source_event_count": source_event_count,
+            "oldest_source_timestamp": oldest_source_timestamp,
+            "newest_source_timestamp": newest_source_timestamp,
+            "data_age_ms": data_age_ms,
+            "alignment": alignment,
+            "lead_lag": lead_lag,
+        }
 
         if alignment.status is AlignmentStatus.UNAVAILABLE:
+            feature_id = self._feature_id(
+                {
+                    **identity_base,
+                    "is_warm": False,
+                    "is_healthy": False,
+                    "unavailable_reasons": alignment.unavailable_reasons,
+                    "price": None,
+                    "order_flow": None,
+                    "positioning": None,
+                    "confirmation": None,
+                }
+            )
             return CrossVenueFeatureSnapshot(
                 symbol=symbol,
                 exchange_timestamp=decision,
@@ -250,16 +290,10 @@ class CrossVenueFeatureEngine:
                 ),
                 okx_book_generation=None if okx is None else okx.book_generation,
                 source_snapshot_ids=source_ids,
-                source_event_count=sum(
-                    snapshot.source_event_count for snapshot in sources
-                ),
-                oldest_source_timestamp=(
-                    min(source_timestamps) if source_timestamps else None
-                ),
-                newest_source_timestamp=(
-                    max(source_timestamps) if source_timestamps else None
-                ),
-                data_age_ms=max(data_ages) if data_ages else None,
+                source_event_count=source_event_count,
+                oldest_source_timestamp=oldest_source_timestamp,
+                newest_source_timestamp=newest_source_timestamp,
+                data_age_ms=data_age_ms,
                 is_warm=False,
                 is_healthy=False,
                 alignment=alignment,
@@ -270,13 +304,15 @@ class CrossVenueFeatureEngine:
         assert binance is not None
         assert okx is not None
         reasons = list(alignment.unavailable_reasons)
-        price = self._price_features(
-            candidates,
-            binance,
-            okx,
-            decision=decision,
-            window_seconds=window_seconds,
-            reasons=reasons,
+        price, spread_history_pair_count, spread_history_sha256 = (
+            self._price_features(
+                candidates,
+                binance,
+                okx,
+                decision=decision,
+                window_seconds=window_seconds,
+                reasons=reasons,
+            )
         )
         order_flow = self._order_flow_features(binance, okx, reasons=reasons)
         positioning = self._positioning_features(binance, okx, reasons=reasons)
@@ -305,6 +341,21 @@ class CrossVenueFeatureEngine:
             and binance.is_healthy
             and okx.is_healthy
         )
+        unavailable_reasons = _unique_reasons(reasons)
+        feature_id = self._feature_id(
+            {
+                **identity_base,
+                "spread_history_pair_count": spread_history_pair_count,
+                "spread_history_sha256": spread_history_sha256,
+                "is_warm": is_warm,
+                "is_healthy": is_healthy,
+                "unavailable_reasons": unavailable_reasons,
+                "price": price,
+                "order_flow": order_flow,
+                "positioning": positioning,
+                "confirmation": confirmation,
+            }
+        )
         return CrossVenueFeatureSnapshot(
             symbol=symbol,
             exchange_timestamp=decision,
@@ -321,20 +372,16 @@ class CrossVenueFeatureEngine:
             binance_book_generation=binance.book_generation,
             okx_book_generation=okx.book_generation,
             source_snapshot_ids=source_ids,
-            source_event_count=sum(
-                snapshot.source_event_count for snapshot in sources
-            ),
-            oldest_source_timestamp=(
-                min(source_timestamps) if source_timestamps else None
-            ),
-            newest_source_timestamp=(
-                max(source_timestamps) if source_timestamps else None
-            ),
-            data_age_ms=max(data_ages) if data_ages else None,
+            spread_history_pair_count=spread_history_pair_count,
+            spread_history_sha256=spread_history_sha256,
+            source_event_count=source_event_count,
+            oldest_source_timestamp=oldest_source_timestamp,
+            newest_source_timestamp=newest_source_timestamp,
+            data_age_ms=data_age_ms,
             is_warm=is_warm,
             is_healthy=is_healthy,
             alignment=alignment,
-            unavailable_reasons=_unique_reasons(reasons),
+            unavailable_reasons=unavailable_reasons,
             price=price,
             order_flow=order_flow,
             positioning=positioning,
@@ -595,7 +642,7 @@ class CrossVenueFeatureEngine:
         decision: datetime,
         window_seconds: int,
         reasons: list[FeatureUnavailableReason],
-    ) -> CrossVenuePriceFeatureValues:
+    ) -> tuple[CrossVenuePriceFeatureValues, int, str | None]:
         binance_mid = (
             None if binance.order_book is None else binance.order_book.mid_price
         )
@@ -615,7 +662,11 @@ class CrossVenueFeatureEngine:
             reasons=reasons,
             channel="price.mid_price_percentage_spread",
         )
-        spread_zscore = self._spread_zscore(
+        (
+            spread_zscore,
+            spread_history_pair_count,
+            spread_history_sha256,
+        ) = self._spread_zscore(
             snapshots,
             symbol=binance.symbol,
             decision=decision,
@@ -654,36 +705,40 @@ class CrossVenueFeatureEngine:
             okx_return,
             channel="price.return_direction_agreement",
         )
-        return CrossVenuePriceFeatureValues(
-            binance_mid_price=binance_mid,
-            okx_mid_price=okx_mid,
-            mid_price_difference=midpoint_difference,
-            mid_price_absolute_spread=absolute_spread,
-            percentage_spread_denominator=denominator,
-            mid_price_percentage_spread=percentage_spread,
-            mid_price_spread_zscore=spread_zscore,
-            return_direction_agreement=_direction_agreement(
-                binance_return,
-                okx_return,
-                epsilon=self.settings.features.cross_venue_direction_epsilon,
+        return (
+            CrossVenuePriceFeatureValues(
+                binance_mid_price=binance_mid,
+                okx_mid_price=okx_mid,
+                mid_price_difference=midpoint_difference,
+                mid_price_absolute_spread=absolute_spread,
+                percentage_spread_denominator=denominator,
+                mid_price_percentage_spread=percentage_spread,
+                mid_price_spread_zscore=spread_zscore,
+                return_direction_agreement=_direction_agreement(
+                    binance_return,
+                    okx_return,
+                    epsilon=self.settings.features.cross_venue_direction_epsilon,
+                ),
+                price_impulse_direction_agreement=_direction_agreement(
+                    binance_impulse,
+                    okx_impulse,
+                    epsilon=self.settings.features.cross_venue_direction_epsilon,
+                ),
+                price_impulse_strength_difference=_difference(
+                    binance_impulse,
+                    okx_impulse,
+                ),
+                realized_volatility_difference=_difference(
+                    binance_volatility,
+                    okx_volatility,
+                ),
+                relative_spread_divergence=_difference(
+                    binance_relative_spread,
+                    okx_relative_spread,
+                ),
             ),
-            price_impulse_direction_agreement=_direction_agreement(
-                binance_impulse,
-                okx_impulse,
-                epsilon=self.settings.features.cross_venue_direction_epsilon,
-            ),
-            price_impulse_strength_difference=_difference(
-                binance_impulse,
-                okx_impulse,
-            ),
-            realized_volatility_difference=_difference(
-                binance_volatility,
-                okx_volatility,
-            ),
-            relative_spread_divergence=_difference(
-                binance_relative_spread,
-                okx_relative_spread,
-            ),
+            spread_history_pair_count,
+            spread_history_sha256,
         )
 
     def _order_flow_features(
@@ -975,9 +1030,9 @@ class CrossVenueFeatureEngine:
         decision: datetime,
         window_seconds: int,
         value: float | None,
-    ) -> float | None:
+    ) -> tuple[float | None, int, str | None]:
         if value is None:
-            return None
+            return None, 0, None
         boundary = decision - timedelta(
             seconds=self.settings.features.zscore_lookback_seconds
         )
@@ -1001,6 +1056,7 @@ class CrossVenueFeatureEngine:
             ):
                 venue_at_time[snapshot.exchange] = snapshot
         history: list[float] = []
+        history_identity: list[dict[str, object]] = []
         for timestamp in sorted(paired):
             pair = paired[timestamp]
             binance = pair.get(Exchange.BINANCE)
@@ -1016,13 +1072,30 @@ class CrossVenueFeatureEngine:
             spread = self._percentage_spread(binance_mid, okx_mid)
             if spread is not None:
                 history.append(spread)
+                history_identity.append(
+                    {
+                        "decision_timestamp": timestamp,
+                        "binance_snapshot_id": binance.feature_snapshot_id,
+                        "okx_snapshot_id": okx.feature_snapshot_id,
+                        "binance_mid_price": binance_mid,
+                        "okx_mid_price": okx_mid,
+                        "percentage_spread": spread,
+                    }
+                )
+        history_sha256 = sha256_text(
+            canonical_json(canonicalize_for_hash(history_identity))
+        )
         minimum = self.settings.features.cross_venue_zscore_minimum_samples
         if len(history) < minimum:
-            return None
+            return None, len(history), history_sha256
         deviation = pstdev(history)
         if deviation == 0:
-            return 0.0 if value == history[-1] else None
-        return (value - fmean(history)) / deviation
+            return None, len(history), history_sha256
+        return (
+            (value - fmean(history)) / deviation,
+            len(history),
+            history_sha256,
+        )
 
     @staticmethod
     def _percentage_spread(
@@ -1157,21 +1230,12 @@ class CrossVenueFeatureEngine:
 
     def _feature_id(
         self,
-        *,
-        symbol: str,
-        decision: datetime,
-        window_seconds: int,
-        binance: FeatureSnapshot | None,
-        okx: FeatureSnapshot | None,
-        status: AlignmentStatus,
+        identity: object,
     ) -> UUID:
-        binance_id = "missing" if binance is None else binance.feature_snapshot_id.hex
-        okx_id = "missing" if okx is None else okx.feature_snapshot_id.hex
+        digest = sha256_text(
+            canonical_json(canonicalize_for_hash(identity))
+        )
         return uuid5(
             NAMESPACE_URL,
-            (
-                f"cvf:cross-venue:{self.settings.app.strategy_version}:"
-                f"{__version__}:{self.config_hash}:{symbol}:{decision.isoformat()}:"
-                f"{window_seconds}:{binance_id}:{okx_id}:{status.value}"
-            ),
+            f"cvf:cross-venue:{digest}",
         )

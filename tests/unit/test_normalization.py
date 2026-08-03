@@ -36,6 +36,11 @@ from cvf.normalization.binance import (
     BinanceDepthUpdatePayload,
 )
 from cvf.normalization.okx import OkxBooksMessage, OkxTradeMessage
+from cvf.replay import RawRecordNormalizer
+from cvf.storage.raw import (
+    NORMALIZED_EVENT_JOURNAL_CHANNEL,
+    normalized_event_journal_record,
+)
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 RECEIVED_AT = datetime(2026, 7, 24, 0, 7, tzinfo=UTC)
@@ -61,6 +66,22 @@ def okx_normalizer() -> OkxNormalizer:
     for filename in ("instrument_btc_live.json", "instrument_eth_live.json"):
         specifications.update(contract_specifications_from_response(load_fixture("okx", filename)))
     return OkxNormalizer(specifications)
+
+
+def test_post_dedup_normalized_event_journal_round_trips_exactly() -> None:
+    event = BinanceNormalizer().normalize(
+        load_fixture("binance", "agg_trade_live.json"),
+        context=context(),
+    )[0]
+    record = normalized_event_journal_record(event)
+
+    assert record.channel == NORMALIZED_EVENT_JOURNAL_CHANNEL
+    assert record.normalization_timestamp == NORMALIZED_AT
+    assert RawRecordNormalizer().normalize(record) == [event]
+
+    mismatched = record.model_copy(update={"symbol": "ETH-USDT-PERP"})
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        RawRecordNormalizer().normalize(mismatched)
 
 
 def test_binance_parses_combined_stream_and_preserves_decimal_units() -> None:

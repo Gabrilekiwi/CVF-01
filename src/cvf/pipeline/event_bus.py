@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from cvf.normalization.common import NormalizedMarketEvent
+from cvf.utils.async_lifecycle import await_task_completion
 
 type EventConsumer = Callable[[NormalizedMarketEvent], Awaitable[None]]
 
@@ -99,6 +100,7 @@ class NormalizedEventBus:
         self._consumers: dict[str, _ConsumerRuntime] = {}
         self._started = False
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     def register(
         self,
@@ -109,7 +111,7 @@ class NormalizedEventBus:
     ) -> None:
         """Register a consumer before the bus starts."""
 
-        if self._started or self._closed:
+        if self._started or self._closed or self._close_task is not None:
             raise EventBusError("consumers can only be registered before the bus starts")
         if not name or name.isspace():
             raise ValueError("consumer name cannot be empty")
@@ -127,6 +129,8 @@ class NormalizedEventBus:
     async def start(self) -> None:
         if self._closed:
             raise EventBusError("cannot restart a closed event bus")
+        if self._close_task is not None:
+            raise EventBusError("cannot start a closing event bus")
         if self._started:
             return
         self._started = True
@@ -160,7 +164,17 @@ class NormalizedEventBus:
             return
         runtime.backpressure_events += 1
         putter = asyncio.create_task(runtime.queue.put(item))
-        done, _ = await asyncio.wait({putter, task}, return_when=asyncio.FIRST_COMPLETED)
+        try:
+            done, _ = await asyncio.wait(
+                {putter, task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            if not putter.done():
+                putter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await putter
+            raise
         if task in done:
             if not putter.done():
                 putter.cancel()
@@ -177,7 +191,7 @@ class NormalizedEventBus:
 
         if not self._started:
             raise EventBusError("start the event bus before publishing")
-        if self._closed:
+        if self._closed or self._close_task is not None:
             raise EventBusError("cannot publish after event bus close")
         self._raise_consumer_failure()
         for runtime in self._consumers.values():
@@ -193,7 +207,7 @@ class NormalizedEventBus:
 
         if not self._started:
             raise EventBusError("event bus is not running")
-        if self._closed:
+        if self._closed or self._close_task is not None:
             raise EventBusError("cannot drain a closed event bus")
         self._raise_consumer_failure()
         joins = {
@@ -227,29 +241,59 @@ class NormalizedEventBus:
     async def close(self) -> None:
         """Drain all queues and surface any consumer failure."""
 
-        if self._closed:
-            return
-        self._closed = True
+        close_task = self._close_task
+        if close_task is None:
+            close_task = asyncio.create_task(
+                self._close_lifecycle(),
+                name="normalized-event-bus-close",
+            )
+            self._close_task = close_task
+        await await_task_completion(close_task)
+
+    async def _close_lifecycle(self) -> None:
         if not self._started:
+            self._closed = True
             return
-        failure: EventBusError | None = None
+        failures: list[BaseException] = []
         try:
             self._raise_consumer_failure()
         except EventBusError as exc:
-            failure = exc
-        for runtime in self._consumers.values():
-            task = runtime.task
-            if task is None or task.done():
-                continue
-            await self._put_or_failure(runtime, _STOP)
-        results = await asyncio.gather(
-            *(runtime.task for runtime in self._consumers.values() if runtime.task is not None),
-            return_exceptions=True,
-        )
-        if failure is not None:
-            raise failure
-        for runtime, result in zip(self._consumers.values(), results, strict=True):
-            if isinstance(result, BaseException):
-                raise EventBusError(
-                    f"normalized event consumer {runtime.name!r} failed: {result}"
-                ) from result
+            failures.append(exc)
+        try:
+            for runtime in self._consumers.values():
+                task = runtime.task
+                if task is None or task.done():
+                    continue
+                try:
+                    await self._put_or_failure(runtime, _STOP)
+                except BaseException as exc:
+                    failures.append(exc)
+            runtimes = [
+                runtime
+                for runtime in self._consumers.values()
+                if runtime.task is not None
+            ]
+            results = await asyncio.gather(
+                *(runtime.task for runtime in runtimes if runtime.task is not None),
+                return_exceptions=True,
+            )
+            for runtime, result in zip(runtimes, results, strict=True):
+                if isinstance(result, BaseException) and all(
+                    result is not failure and failure.__cause__ is not result
+                    for failure in failures
+                ):
+                    failures.append(
+                        EventBusError(
+                            "normalized event consumer "
+                            f"{runtime.name!r} failed: {result}"
+                        )
+                    )
+        finally:
+            self._closed = True
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup(
+                "normalized event bus close failures",
+                failures,
+            )

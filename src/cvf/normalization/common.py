@@ -10,6 +10,7 @@ from typing import TypedDict
 from cvf.models.enums import Exchange
 from cvf.models.market import (
     BestBidAsk,
+    ExchangeHealth,
     FundingRate,
     IndexPrice,
     LiquidationEvent,
@@ -30,6 +31,7 @@ type NormalizedMarketEvent = (
     | MarkPrice
     | IndexPrice
     | LiquidationEvent
+    | ExchangeHealth
 )
 
 

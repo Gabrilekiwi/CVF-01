@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -14,6 +19,8 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
+import cvf.storage.features as feature_storage
+from cvf import __version__
 from cvf.config import Settings, load_settings
 from cvf.features import CrossVenueFeatureEngine
 from cvf.features.models import (
@@ -95,7 +102,7 @@ def single(
         sequence_id=identifier,
         raw_payload_reference=f"raw://{UUID(int=identifier)}",
         feature_snapshot_id=UUID(int=identifier),
-        strategy_version="0.3.0",
+        strategy_version=__version__,
         calculation_timestamp=at,
         decision_timestamp=at,
         window_seconds=window_seconds,
@@ -269,9 +276,181 @@ async def test_deduplication_cache_has_hard_capacity() -> None:
         await writer.start()
         await writer.write(single(Exchange.BINANCE, identifier=101))
         await writer.write(single(Exchange.OKX, identifier=102))
+        assert (
+            await writer.write(single(Exchange.BINANCE, identifier=101))
+            is FeatureWriteStatus.DEDUPLICATED
+        )
         await writer.close()
 
         assert writer.stats.deduplication_cache_size == 1
+        assert audit_feature_tree(temporary).rows == 2
+
+
+@pytest.mark.asyncio
+async def test_new_writer_rebuilds_restart_safe_deduplication_index() -> None:
+    with scratch_directory() as temporary:
+        config = settings()
+        first = single(Exchange.BINANCE, identifier=111)
+        second = single(Exchange.OKX, identifier=112)
+        initial = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=1,
+            deduplication_capacity=1,
+        )
+        await initial.start()
+        await initial.write(first)
+        await initial.write(second)
+        await initial.close()
+
+        index_path = temporary / ".feature-deduplication-v1.sqlite3"
+        assert index_path.is_file()
+        index_path.unlink()
+
+        restarted = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=1,
+            deduplication_capacity=1,
+        )
+        await restarted.start()
+        assert (
+            await restarted.write(first)
+            is FeatureWriteStatus.DEDUPLICATED
+        )
+        conflict = second.model_copy(
+            update={"decision_timestamp": NOW + timedelta(seconds=1)}
+        )
+        with pytest.raises(FeatureParquetError, match="different content"):
+            await restarted.write(conflict)
+        assert (
+            await restarted.write(single(Exchange.BINANCE, identifier=113))
+            is FeatureWriteStatus.ACCEPTED
+        )
+        await restarted.close()
+
+        audit = audit_feature_tree(temporary)
+        assert audit.rows == audit.unique_snapshot_ids == 3
+        assert audit.files == 3
+        assert restarted.stats.deduplication_cache_size == 1
+
+
+@pytest.mark.asyncio
+async def test_feature_root_claim_is_exclusive_across_writer_instances() -> None:
+    with scratch_directory() as temporary:
+        config = settings()
+        first = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+        )
+        contender = AsyncFeatureParquetWriter(
+            root_path=temporary / "feature_schema=v1",
+            settings=config,
+        )
+
+        await first.start()
+        assert first._root_claim is not None
+        with pytest.raises(FeatureParquetError, match="already claimed"):
+            await contender.start()
+        assert contender._root_claim is None
+
+        await first.close()
+        assert first._root_claim is None
+
+        await contender.start()
+        assert contender._root_claim is not None
+        await contender.close()
+        assert contender._root_claim is None
+
+
+@pytest.mark.asyncio
+async def test_feature_root_claim_is_exclusive_across_processes() -> None:
+    child_script = """
+import asyncio
+import sys
+from pathlib import Path
+
+from cvf.config import load_settings
+from cvf.storage.features import AsyncFeatureParquetWriter
+
+
+async def main() -> None:
+    writer = AsyncFeatureParquetWriter(
+        root_path=Path(sys.argv[1]),
+        settings=load_settings(environ={}),
+    )
+    await writer.start()
+    print("READY", flush=True)
+    await asyncio.to_thread(sys.stdin.readline)
+    await writer.close()
+    print("CLOSED", flush=True)
+
+
+asyncio.run(main())
+"""
+    with scratch_directory() as temporary:
+        environment = os.environ.copy()
+        source_root = str(Path("src").resolve())
+        existing_pythonpath = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            source_root
+            if not existing_pythonpath
+            else source_root + os.pathsep + existing_pythonpath
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_script, str(temporary.resolve())],
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        contender = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=settings(),
+        )
+        try:
+            ready = await asyncio.wait_for(
+                asyncio.to_thread(process.stdout.readline),
+                timeout=10,
+            )
+            assert ready.strip() == "READY"
+
+            with pytest.raises(FeatureParquetError, match="already claimed"):
+                await contender.start()
+            assert contender._root_claim is None
+
+            process.stdin.write("\n")
+            process.stdin.flush()
+            returncode = await asyncio.wait_for(
+                asyncio.to_thread(process.wait),
+                timeout=10,
+            )
+            assert returncode == 0
+            assert process.stdout.readline().strip() == "CLOSED"
+
+            await contender.start()
+            assert contender._root_claim is not None
+            await contender.close()
+            assert contender._root_claim is None
+        finally:
+            if contender._task is not None and not contender._closed:
+                await contender.close()
+            if process.poll() is None:
+                process.stdin.close()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(process.wait),
+                        timeout=5,
+                    )
+                except TimeoutError:
+                    process.kill()
+                    await asyncio.to_thread(process.wait)
+            process.stdout.close()
+            process.stderr.close()
 
 
 @pytest.mark.asyncio
@@ -356,6 +535,504 @@ async def test_queue_backpressure_is_observable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_backpressure_callback_failure_rolls_back_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with scratch_directory() as temporary:
+        value = single(Exchange.BINANCE, identifier=211)
+
+        def fail_callback(_snapshot: FeatureSnapshot) -> None:
+            raise RuntimeError("observer failed")
+
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=settings(),
+            on_backpressure=fail_callback,
+        )
+        await writer.start()
+        original_full = writer._queue.full
+        monkeypatch.setattr(writer._queue, "full", lambda: True)
+        with pytest.raises(FeatureParquetError, match="observer failed"):
+            await writer.write(value)
+        monkeypatch.setattr(writer._queue, "full", original_full)
+        writer._on_backpressure = None
+
+        assert await writer.write(value) is FeatureWriteStatus.ACCEPTED
+        await writer.close()
+        assert audit_feature_tree(temporary).rows == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_write_rolls_back_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with scratch_directory() as temporary:
+        config = settings()
+        write_started = threading.Event()
+        release_write = threading.Event()
+        original_write = feature_storage._write_partition_file
+
+        def block_first_write(
+            root: Path,
+            partition: tuple[str, str, str],
+            envelopes: Sequence[feature_storage._FeatureEnvelope],
+        ) -> Path:
+            if not write_started.is_set():
+                write_started.set()
+                if not release_write.wait(timeout=5):
+                    raise TimeoutError("test did not release feature write")
+            return original_write(root, partition, envelopes)
+
+        monkeypatch.setattr(
+            feature_storage,
+            "_write_partition_file",
+            block_first_write,
+        )
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=1,
+            flush_seconds=60,
+            queue_capacity=1,
+        )
+        await writer.start()
+        await writer.write(single(Exchange.BINANCE, identifier=221))
+        assert await asyncio.to_thread(write_started.wait, 2)
+        await writer.write(single(Exchange.OKX, identifier=222))
+
+        cancelled_value = single(Exchange.BINANCE, identifier=223)
+        pending = asyncio.create_task(writer.write(cancelled_value))
+        while writer.stats.backpressure_events == 0:
+            await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        release_write.set()
+        await writer.close()
+        monkeypatch.setattr(
+            feature_storage,
+            "_write_partition_file",
+            original_write,
+        )
+
+        restarted = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=1,
+        )
+        await restarted.start()
+        assert (
+            await restarted.write(cancelled_value)
+            is FeatureWriteStatus.ACCEPTED
+        )
+        await restarted.close()
+        assert audit_feature_tree(temporary).rows == 3
+
+
+@pytest.mark.asyncio
+async def test_duplicate_waiter_takes_over_cancelled_pending_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with scratch_directory() as temporary:
+        write_started = threading.Event()
+        release_write = threading.Event()
+        original_write = feature_storage._write_partition_file
+
+        def block_first_write(
+            root: Path,
+            partition: tuple[str, str, str],
+            envelopes: Sequence[feature_storage._FeatureEnvelope],
+        ) -> Path:
+            if not write_started.is_set():
+                write_started.set()
+                if not release_write.wait(timeout=5):
+                    raise TimeoutError("test did not release feature write")
+            return original_write(root, partition, envelopes)
+
+        monkeypatch.setattr(
+            feature_storage,
+            "_write_partition_file",
+            block_first_write,
+        )
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=settings(),
+            batch_rows=1,
+            flush_seconds=60,
+            queue_capacity=1,
+        )
+        await writer.start()
+        first = single(Exchange.BINANCE, identifier=225)
+        second = single(Exchange.OKX, identifier=226)
+        contested = single(Exchange.BINANCE, identifier=227)
+        await writer.write(first)
+        assert await asyncio.to_thread(write_started.wait, 2)
+        await writer.write(second)
+
+        owner = asyncio.create_task(writer.write(contested))
+        while writer.stats.backpressure_events == 0:
+            await asyncio.sleep(0)
+        duplicate = asyncio.create_task(writer.write(contested))
+        await asyncio.sleep(0)
+        assert not duplicate.done()
+
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        assert not duplicate.done()
+
+        release_write.set()
+        assert await duplicate is FeatureWriteStatus.ACCEPTED
+        await writer.close()
+
+        audit = audit_feature_tree(temporary)
+        assert audit.rows == audit.unique_snapshot_ids == 3
+        assert writer.stats.accepted_snapshots == writer.stats.written_snapshots == 3
+        assert writer.stats.deduplicated_snapshots == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_index_rebuild_finishes_before_start_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with scratch_directory() as temporary:
+        rebuild_started = threading.Event()
+        release_rebuild = threading.Event()
+        original_rebuild = feature_storage._rebuild_feature_index
+
+        def blocking_rebuild(root: Path, index_path: Path) -> None:
+            rebuild_started.set()
+            if not release_rebuild.wait(timeout=5):
+                raise TimeoutError("test did not release feature index rebuild")
+            original_rebuild(root, index_path)
+
+        monkeypatch.setattr(
+            feature_storage,
+            "_rebuild_feature_index",
+            blocking_rebuild,
+        )
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=settings(),
+        )
+        starting = asyncio.create_task(writer.start())
+        assert await asyncio.to_thread(rebuild_started.wait, 2)
+        starting.cancel()
+        await asyncio.sleep(0)
+        starting.cancel()
+        await asyncio.sleep(0)
+
+        assert not starting.done()
+        assert writer._task is None
+        assert writer._index is None
+        assert writer._root_claim is not None
+        contender = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=settings(),
+        )
+        with pytest.raises(FeatureParquetError, match="already claimed"):
+            await contender.start()
+        assert contender._root_claim is None
+
+        release_rebuild.set()
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+
+        assert writer._task is None
+        assert writer._index is None
+        assert writer._root_claim is None
+        assert not list(temporary.glob(".*.tmp"))
+
+        monkeypatch.setattr(
+            feature_storage,
+            "_rebuild_feature_index",
+            original_rebuild,
+        )
+        await writer.start()
+        assert writer._root_claim is not None
+        await writer.close()
+        assert writer._root_claim is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waits_for_shared_feature_close_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with scratch_directory() as temporary:
+        write_started = threading.Event()
+        release_write = threading.Event()
+        original_write = feature_storage._write_partition_file
+
+        def block_write(
+            root: Path,
+            partition: tuple[str, str, str],
+            envelopes: Sequence[feature_storage._FeatureEnvelope],
+        ) -> Path:
+            write_started.set()
+            if not release_write.wait(timeout=5):
+                raise TimeoutError("test did not release feature write")
+            return original_write(root, partition, envelopes)
+
+        monkeypatch.setattr(feature_storage, "_write_partition_file", block_write)
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=settings(),
+            batch_rows=1,
+            flush_seconds=60,
+            queue_capacity=2,
+        )
+        await writer.start()
+        await writer.write(single(Exchange.BINANCE, identifier=224))
+        assert await asyncio.to_thread(write_started.wait, 2)
+
+        cancelled_close = asyncio.create_task(writer.close())
+        while writer._close_task is None:
+            await asyncio.sleep(0)
+        saved_close_task = writer._close_task
+        concurrent_close = asyncio.create_task(writer.close())
+        cancelled_close.cancel()
+        await asyncio.sleep(0)
+
+        assert not cancelled_close.done()
+        assert writer._close_task is saved_close_task
+        assert writer._closed is False
+        assert writer._task is not None and not writer._task.done()
+        assert writer._index is not None
+        assert writer._index.in_transaction is False
+        assert writer._root_claim is not None
+
+        release_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_close
+        await concurrent_close
+
+        assert writer._closed is True
+        assert saved_close_task.done()
+        assert writer._task.done()
+        assert writer._index is None
+        assert writer._root_claim is None
+        assert writer.stats.accepted_snapshots == writer.stats.written_snapshots == 1
+        assert audit_feature_tree(temporary).rows == 1
+
+
+@pytest.mark.asyncio
+async def test_many_records_use_bounded_index_transactions_and_restart_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with scratch_directory() as temporary:
+        monkeypatch.setattr(feature_storage, "_INDEX_TRANSACTION_ROWS", 17)
+        config = settings()
+        values = [
+            single(
+                Exchange.BINANCE if identifier % 2 else Exchange.OKX,
+                identifier=identifier,
+            )
+            for identifier in range(2_000, 2_150)
+        ]
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=500,
+            flush_seconds=60,
+            queue_capacity=200,
+            deduplication_capacity=8,
+        )
+        await writer.start()
+        assert writer._index is not None
+        assert writer._index.in_transaction is False
+
+        for value in values:
+            assert await writer.write(value) is FeatureWriteStatus.ACCEPTED
+        assert writer._index.in_transaction is False
+        assert writer._index.execute(
+            """
+            SELECT COUNT(*)
+            FROM feature_snapshot_index
+            WHERE persistence_state = 'PENDING'
+            """
+        ).fetchone() == (len(values),)
+
+        transaction_statements: list[str] = []
+        writer._index.set_trace_callback(transaction_statements.append)
+        await writer.close()
+        assert writer._index is None
+        assert transaction_statements.count("COMMIT") >= 10
+        index = sqlite3.connect(temporary / ".feature-deduplication-v1.sqlite3")
+        try:
+            states = index.execute(
+                """
+                SELECT persistence_state, COUNT(*)
+                FROM feature_snapshot_index
+                GROUP BY persistence_state
+                """
+            ).fetchall()
+        finally:
+            index.close()
+        assert states == [("COMMITTED", len(values))]
+
+        restarted = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=500,
+            deduplication_capacity=8,
+        )
+        await restarted.start()
+        assert restarted._index is not None
+        assert restarted._index.in_transaction is False
+        assert (
+            await restarted.write(values[0])
+            is FeatureWriteStatus.DEDUPLICATED
+        )
+        assert restarted._index.in_transaction is False
+        await restarted.close()
+        assert audit_feature_tree(temporary).rows == len(values)
+
+
+@pytest.mark.asyncio
+async def test_rebuild_discards_crash_stale_sqlite_wal() -> None:
+    with scratch_directory() as temporary:
+        config = settings()
+        truth = single(Exchange.BINANCE, identifier=228)
+        stale = single(Exchange.OKX, identifier=229)
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=1,
+        )
+        await writer.start()
+        assert await writer.write(truth) is FeatureWriteStatus.ACCEPTED
+        stale_envelope = writer._envelope(stale)
+        await writer.close()
+
+        index_path = temporary / ".feature-deduplication-v1.sqlite3"
+        child = """
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute("DELETE FROM feature_snapshot_index")
+connection.execute(
+    \"\"\"
+    INSERT INTO feature_snapshot_index (
+        feature_snapshot_id,
+        payload_sha256,
+        code_version,
+        config_hash,
+        persistence_state
+    ) VALUES (?, ?, ?, ?, 'PENDING')
+    \"\"\",
+    tuple(sys.argv[2:6]),
+)
+connection.commit()
+os._exit(0)
+"""
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child,
+                str(index_path.resolve()),
+                str(stale.feature_snapshot_id),
+                *stale_envelope.content_identity,
+            ],
+            check=True,
+        )
+        assert Path(f"{index_path}-wal").is_file()
+
+        restarted = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=1,
+        )
+        await restarted.start()
+        assert (
+            await restarted.write(truth)
+            is FeatureWriteStatus.DEDUPLICATED
+        )
+        assert (
+            await restarted.write(stale)
+            is FeatureWriteStatus.ACCEPTED
+        )
+        await restarted.close()
+
+        audit = audit_feature_tree(temporary)
+        assert audit.rows == audit.unique_snapshot_ids == 2
+        index = sqlite3.connect(index_path)
+        try:
+            rows = index.execute(
+                """
+                SELECT feature_snapshot_id, persistence_state
+                FROM feature_snapshot_index
+                ORDER BY feature_snapshot_id
+                """
+            ).fetchall()
+        finally:
+            index.close()
+        assert rows == sorted(
+            [
+                (str(truth.feature_snapshot_id), "COMMITTED"),
+                (str(stale.feature_snapshot_id), "COMMITTED"),
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_replace_failure_is_propagated_and_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with scratch_directory() as temporary:
+        config = settings()
+        value = single(Exchange.BINANCE, identifier=231)
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=1,
+        )
+        await writer.start()
+        original_replace = feature_storage.os.replace
+
+        def fail_parquet_replace(source: str, destination: str) -> None:
+            if str(destination).endswith(".parquet"):
+                raise OSError("simulated replace failure")
+            original_replace(source, destination)
+
+        monkeypatch.setattr(
+            feature_storage.os,
+            "replace",
+            fail_parquet_replace,
+        )
+        assert await writer.write(value) is FeatureWriteStatus.ACCEPTED
+        while writer.stats.last_error is None:
+            await asyncio.sleep(0)
+        with pytest.raises(FeatureParquetError, match="replace failure"):
+            await writer.write(single(Exchange.OKX, identifier=232))
+        with pytest.raises(FeatureParquetError, match="replace failure"):
+            await writer.close()
+        assert writer._root_claim is None
+        assert not parquet_files(temporary)
+        assert not list(temporary.rglob("*.tmp"))
+
+        monkeypatch.setattr(
+            feature_storage.os,
+            "replace",
+            original_replace,
+        )
+        restarted = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=config,
+            batch_rows=1,
+        )
+        await restarted.start()
+        assert await restarted.write(value) is FeatureWriteStatus.ACCEPTED
+        await restarted.close()
+        assert audit_feature_tree(temporary).rows == 1
+
+
+@pytest.mark.asyncio
 async def test_partition_files_are_atomic_and_leave_no_temp_siblings() -> None:
     with scratch_directory() as temporary:
         await write_tree(temporary, [single(Exchange.BINANCE)])
@@ -380,6 +1057,61 @@ async def test_rows_are_deterministically_sorted_inside_partition() -> None:
             earlier.feature_snapshot_id,
             later.feature_snapshot_id,
         ]
+
+
+def test_reader_and_audit_reject_nonexistent_or_uninitialized_roots() -> None:
+    with scratch_directory() as temporary:
+        missing = temporary / "missing"
+        with pytest.raises(ValueError, match="does not exist"):
+            list(FeatureParquetReader(missing).iter_records())
+        with pytest.raises(ValueError, match="missing feature_schema=v1"):
+            audit_feature_tree(temporary)
+
+
+def test_reader_rejects_empty_feature_schema_tree() -> None:
+    with scratch_directory() as temporary:
+        (temporary / "feature_schema=v1").mkdir()
+        with pytest.raises(ValueError, match="no Parquet data"):
+            list(FeatureParquetReader(temporary).iter_records())
+
+
+@pytest.mark.asyncio
+async def test_writer_rejects_a_root_that_already_contains_raw_parquet() -> None:
+    with scratch_directory() as temporary:
+        raw_partition = temporary / "date=2026-07-27" / "exchange=BINANCE"
+        raw_partition.mkdir(parents=True)
+        pq.write_table(
+            pa.table({"raw_payload": [b"{}"]}),
+            raw_partition / "raw.parquet",
+        )
+        writer = AsyncFeatureParquetWriter(
+            root_path=temporary,
+            settings=settings(),
+        )
+
+        with pytest.raises(FeatureParquetError, match="outside schema tree"):
+            await writer.start()
+        assert writer._root_claim is None
+
+
+@pytest.mark.asyncio
+async def test_reader_rejects_unknown_schema_directory() -> None:
+    with scratch_directory() as temporary:
+        await write_tree(temporary, [single(Exchange.BINANCE)])
+        (temporary / "feature_schema=v2").mkdir()
+
+        with pytest.raises(ValueError, match="unknown feature schema"):
+            list(FeatureParquetReader(temporary).iter_records())
+
+
+@pytest.mark.asyncio
+async def test_reader_rejects_parquet_outside_schema_tree() -> None:
+    with scratch_directory() as temporary:
+        await write_tree(temporary, [single(Exchange.BINANCE)])
+        shutil.copyfile(parquet_files(temporary)[0], temporary / "stray.parquet")
+
+        with pytest.raises(ValueError, match="outside schema tree"):
+            audit_feature_tree(temporary)
 
 
 @pytest.mark.asyncio
@@ -500,6 +1232,12 @@ async def test_reader_filters_schema_snapshot_id_and_unavailable_reason() -> Non
             )
             == []
         )
+        empty_audit = audit_feature_tree(
+            temporary,
+            filters=FeatureScanFilter(schema_versions=frozenset({2})),
+        )
+        assert empty_audit.rows == empty_audit.files == 0
+        assert empty_audit.content_digest == "0" * 64
 
 
 def test_scan_filter_rejects_naive_reversed_and_invalid_values() -> None:
@@ -599,7 +1337,7 @@ async def test_audit_reports_lineage_scope_and_time_bounds() -> None:
         assert audit.rows == audit.unique_snapshot_ids == 3
         assert audit.partitions == 3
         assert audit.scopes == ("BINANCE", "CROSS_VENUE", "OKX")
-        assert audit.code_versions == ("0.3.0",)
+        assert audit.code_versions == (__version__,)
         assert audit.config_hashes
         assert audit.unavailable_snapshots == 1
         assert audit.unavailable_reason_counts == {

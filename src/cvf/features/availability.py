@@ -84,7 +84,16 @@ def evaluate_availability(
                 channel="open_interest",
             )
         )
-    for channel, status in state.health_by_channel.items():
+    health_sources = state.health_sources_at_or_before(decision_at)
+    health_statuses = (
+        {
+            item.value.channel: item.value.status
+            for item in health_sources
+        }
+        if len(state.exchange_health_events) or len(state.health_events)
+        else state.health_by_channel
+    )
+    for channel, status in health_statuses.items():
         if status in blocked_health_statuses:
             reasons.append(
                 FeatureUnavailableReason(
