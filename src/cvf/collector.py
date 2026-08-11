@@ -294,9 +294,15 @@ class MarketDataCollector:
             rss_samples.append(current_rss)
             snapshots = self.health_snapshots(now=checked_at)
             for snapshot in snapshots:
+                # A status batch can take longer than the receive-time reorder
+                # window. Stamp each synthetic health event when it enters the
+                # journal/publish path instead of reusing the batch timestamp;
+                # otherwise the live clock can legitimately advance past later
+                # events in the same batch.
+                health_event_at = datetime.now(UTC)
                 health_event = self._health.exchange_health(
                     snapshot.key,
-                    now=checked_at,
+                    now=health_event_at,
                 )
                 await self._record_event(health_event)
             self._logger.info(
