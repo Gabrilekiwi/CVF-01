@@ -12,7 +12,7 @@ import cvf.collector as collector_module
 from cvf.collector import MarketDataCollector
 from cvf.config import load_settings
 from cvf.models import Exchange
-from cvf.monitoring import StreamKey
+from cvf.monitoring import StreamHealthRegistry, StreamKey
 
 
 @pytest.mark.asyncio
@@ -53,11 +53,20 @@ async def test_status_loop_stamps_each_health_event_when_it_is_published(
 
     observed_times = []
 
-    def fake_exchange_health(key: StreamKey, *, now: Any) -> object:
+    def fake_exchange_health(
+        self: StreamHealthRegistry,
+        key: StreamKey,
+        *,
+        now: Any,
+    ) -> object:
         observed_times.append(now)
         return object()
 
-    monkeypatch.setattr(collector._health, "exchange_health", fake_exchange_health)
+    monkeypatch.setattr(
+        StreamHealthRegistry,
+        "exchange_health",
+        fake_exchange_health,
+    )
 
     stop_event = asyncio.Event()
 
